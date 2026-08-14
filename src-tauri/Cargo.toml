@@ -1,0 +1,32 @@
+[package]
+name = "masaifu"
+version = "1.0.0"
+description = "马赛福 - 常驻托盘的灵感与剪贴板个人工具"
+authors = ["vager"]
+edition = "2021"
+
+[lib]
+name = "masaifu_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-single-instance = "2"
+tauri-plugin-autostart = "2"
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-notification = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+arboard = "3"
+reqwest = { version = "0.12", features = ["json"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+chrono = { version = "0.4", features = ["serde"] }
+sha2 = "0.10"
+windows = { version = "0.58", features = ["Win32_UI_Input_KeyboardAndMouse", "Win32_System_SystemInformation", "Win32_Foundation"] }
+dirs = "5"
+log = "0.4"
+env_logger = "0.11"

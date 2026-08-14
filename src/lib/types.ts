@@ -1,0 +1,90 @@
+export interface Settings {
+  apiKey: string;
+  baseUrl: string;
+  model: string;
+  summaryTime: string;
+  idleThresholdMin: number;
+  markdownDir: string;
+  promptTemplate: string;
+  hotkey: string;
+  autostart: boolean;
+  aiAnswerEnabled: boolean;
+  pollIntervalMs: number;
+  theme: string;
+  weeklySummaryDay: number;
+  weeklySummaryTime: string;
+  weeklyPromptTemplate: string;
+  dedupScope: string;
+}
+
+export interface EntryRow {
+  id: number;
+  rawContent: string;
+  cleanContent: string | null;
+  title: string | null;
+  category: string | null;
+  tags: string | null;
+  source: string;
+  processed: boolean;
+  createdAt: string;
+  processedAt: string | null;
+}
+
+export interface EntryPage {
+  entries: EntryRow[];
+  total: number;
+}
+
+export interface SummaryRow {
+  date: string;
+  content: string;
+  markdownPath: string;
+  status: string;
+  createdAt: string;
+}
+
+export interface SearchHit {
+  docType: string;
+  docId: string;
+  title: string;
+  content: string;
+  category: string;
+  tags: string;
+  source: string;
+  createdAt: string;
+  rank: number;
+}
+
+export interface CountRow {
+  key: string;
+  count: number;
+}
+
+export interface TreeStats {
+  totalEntries: number;
+  byCategory: CountRow[];
+  bySource: CountRow[];
+  summaryDates: string[];
+}
+
+export interface ReminderRow {
+  id: number;
+  title: string;
+  note: string;
+  kind: "once" | "daily" | "weekly";
+  timeOfDay: string;
+  weekday: number | null;
+  fireDate: string | null;
+  nextFireAt: string;
+  enabled: boolean;
+  lastFiredAt: string | null;
+  createdAt: string;
+}
+
+export const CATEGORIES = ["灵感", "代码", "文章", "链接", "待办", "其他"] as const;
+
+export const SOURCE_LABEL: Record<string, string> = {
+  clipboard: "剪贴板",
+  manual: "灵感",
+  summary: "汇总",
+};
