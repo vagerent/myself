@@ -1,6 +1,6 @@
 # 马赛福（Masaifu）
 
-> 常驻系统托盘的个人信息搜索与蒸馏工具：自动收集剪贴板与手动记录的灵感，经 AI 蒸馏整理，支持全文搜索、AI 问答、每日/每周汇总与任务提醒。数据全部存本机。
+> 常驻系统托盘的个人信息搜索与蒸馏工具：自动收集剪贴板与手动记录的灵感，导入会议录音自动转写并生成纪要，经 AI 蒸馏整理，支持全文搜索、AI 问答、每日/每周汇总与任务提醒。数据全部存本机。
 
 **官网**：https://myself.mavenzero.com/
 
@@ -22,6 +22,14 @@
 - **智能排重**：支持「当日排重」（同一天相同内容只记一次）或「全量排重」（相同内容永远只记一次），设置页可切换
 - **AI 预处理**：空闲时自动清洗内容、提取标题、分类（灵感/代码/文章/链接/待办/其他）并打标签
 - **手动记录**：随手记下灵感，立即入库
+
+### 会议录音
+
+- **音频导入转写**：浏览页导入常见音频格式（mp3/m4a/wav 等），本地解码后经 SenseVoice 模型离线转写，全程不联网
+- **发言人分离 + 时间戳**：CAM++ 声纹模型自动区分说话人，转写文本带 `[说话人N mm:ss]` 前缀
+- **AI 会议纪要**：转写全文自动送入 AI 生成结构化纪要，提示词模板可自定义；详情页「会议纪要 / 原始内容」页签随时对照
+- **进度可视**：解码、说话人分析、逐块转写、纪要生成各阶段均有进度条
+- **模型按需下载**：首次使用从 ModelScope 一键下载语音识别 / 端点检测 / 声纹三个模型（约 260MB），设置页查看状态
 
 ### 搜索与问答
 
@@ -51,11 +59,11 @@ npm install
 npm run tauri build
 ```
 
-安装包输出在 `src-tauri/target/release/bundle/`。
+安装包输出在 `src-tauri/target/release/bundle/`。如需会议录音功能，打包前先按 `tools/build_sidecar.md` 构建 sidecar（产物会一并打进安装包）。
 
 ## 开发
 
-前置要求：Node.js 18+、Rust 工具链（Tauri 2 依赖，Windows 需 MSVC Build Tools）。
+前置要求：Node.js 18+、Rust 工具链（Tauri 2 依赖，Windows 需 MSVC Build Tools）。会议录音功能还需要先按 `tools/build_sidecar.md` 构建语音转写 sidecar（缺省时其余功能不受影响）。
 
 ```bash
 npm install
@@ -68,13 +76,14 @@ npm run tauri dev
 - **托盘菜单**（右键）：打开搜索、今日汇总、任务提醒、设置、退出
 - **精简窗口**：搜索框输入即出关键词结果；按 Enter 或点「AI 回答」基于命中结果生成回答；底部输入框手动记录灵感；右上角「最大化」进入全量窗口
 - **全量窗口**：左侧分类树（全部 / 分类 / 来源 / 每日汇总 / 每周汇总 / 定时任务），右侧条目列表与详情；搜索在当前选中节点内过滤，无结果时自动进入 AI 兜底搜索
-- **设置页**：OpenAI API Key、模型、base_url、汇总时间、每周汇总（星期几 + 时间）、空闲阈值、快捷键、Markdown 输出目录、每日/每周提示词模板、排重方式、主题、开机自启
+- **设置页**：左侧分类导航（AI 服务 / 汇总 / 会议录音 / 通用），含 API Key、模型、base_url、汇总时间、每周汇总（星期几 + 时间）、空闲阈值、快捷键、Markdown 输出目录、各类提示词模板、语音模型下载、排重方式、主题、开机自启
 
-> AI 功能（预处理、汇总、问答、兜底搜索）依赖 OpenAI 兼容的 Chat Completions API，未配置 API Key 时自动跳过，不影响收集与搜索。
+> AI 功能（预处理、汇总、问答、兜底搜索、会议纪要）依赖 OpenAI 兼容的 Chat Completions API，未配置 API Key 时自动跳过，不影响收集与搜索。语音转写为纯本地离线推理，不需要 API Key。
 
 ## 技术栈
 
-- **后端**：Tauri 2（Rust）、rusqlite（SQLite + FTS5 trigram）、reqwest（OpenAI 兼容 API）
+- **后端**：Tauri 2（Rust）、rusqlite（SQLite + FTS5 trigram）、reqwest（OpenAI 兼容 API）、symphonia + rubato（音频解码与重采样）
+- **语音转写**：PyInstaller 冻结的 funasr-onnx sidecar（SenseVoiceSmall 识别 + FSMN-VAD 端点检测 + CAM++ 说话人分离），构建方法见 `tools/build_sidecar.md`
 - **前端**：Svelte 4 + TypeScript + Vite
 
 ## 数据位置
@@ -82,6 +91,7 @@ npm run tauri dev
 | 数据 | 位置 |
 | --- | --- |
 | SQLite 数据库 / 设置 / 窗口状态 | `%APPDATA%\com.masaifu.desktop\` |
+| 语音模型（识别 / VAD / 声纹） | `%APPDATA%\com.masaifu.desktop\models\` |
 | 每日汇总 Markdown | `文档\Masaifu\daily\YYYY-MM-DD.md`（可修改） |
 | 每周汇总 Markdown | `文档\Masaifu\weekly\YYYY-Www.md` |
 
