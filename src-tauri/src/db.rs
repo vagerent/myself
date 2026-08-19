@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 pub type Db = Arc<Mutex<Connection>>;
 
-pub const CATEGORIES: [&str; 6] = ["灵感", "代码", "文章", "链接", "待办", "其他"];
+pub const CATEGORIES: [&str; 7] = ["灵感", "代码", "文章", "链接", "待办", "会议", "其他"];
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -217,7 +217,7 @@ pub fn insert_entry(
 
 pub fn unprocessed_batch(conn: &Connection, limit: usize) -> rusqlite::Result<Vec<UnprocessedRow>> {
     let mut stmt = conn.prepare(
-        "SELECT id, raw_content FROM entries WHERE processed = 0 ORDER BY created_at ASC LIMIT ?1",
+        "SELECT id, raw_content FROM entries WHERE processed = 0 AND source != 'meeting' ORDER BY created_at ASC LIMIT ?1",
     )?;
     let rows = stmt
         .query_map(params![limit as i64], |r| {
@@ -236,7 +236,7 @@ pub fn unprocessed_for_date(
     limit: usize,
 ) -> rusqlite::Result<Vec<UnprocessedRow>> {
     let mut stmt = conn.prepare(
-        "SELECT id, raw_content FROM entries WHERE processed = 0 AND created_at LIKE ?1 ORDER BY created_at ASC LIMIT ?2",
+        "SELECT id, raw_content FROM entries WHERE processed = 0 AND source != 'meeting' AND created_at LIKE ?1 ORDER BY created_at ASC LIMIT ?2",
     )?;
     let like = format!("{date}%");
     let rows = stmt
@@ -357,7 +357,7 @@ pub fn unprocessed_for_range(
     limit: usize,
 ) -> rusqlite::Result<Vec<UnprocessedRow>> {
     let mut stmt = conn.prepare(
-        "SELECT id, raw_content FROM entries WHERE processed = 0 AND created_at >= ?1 AND created_at <= ?2 ORDER BY created_at ASC LIMIT ?3",
+        "SELECT id, raw_content FROM entries WHERE processed = 0 AND source != 'meeting' AND created_at >= ?1 AND created_at <= ?2 ORDER BY created_at ASC LIMIT ?3",
     )?;
     let rows = stmt
         .query_map(

@@ -15,6 +15,7 @@ export interface Settings {
   weeklySummaryTime: string;
   weeklyPromptTemplate: string;
   dedupScope: string;
+  meetingPromptTemplate: string;
 }
 
 export interface EntryRow {
@@ -81,10 +82,17 @@ export interface ReminderRow {
   createdAt: string;
 }
 
-export const CATEGORIES = ["灵感", "代码", "文章", "链接", "待办", "其他"] as const;
+export const CATEGORIES = ["灵感", "代码", "文章", "链接", "待办", "会议", "其他"] as const;
 
 export const SOURCE_LABEL: Record<string, string> = {
   clipboard: "剪贴板",
   manual: "灵感",
   summary: "汇总",
+  meeting: "会议录音",
 };
+
+export interface AsrModelStatus {
+  downloaded: boolean;
+  path: string;
+  sidecarReady: boolean;
+}

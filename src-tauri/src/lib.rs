@@ -1,6 +1,7 @@
 mod commands;
 mod db;
 mod hotkey;
+mod meeting;
 mod openai;
 mod settings;
 mod tasks;
@@ -24,6 +25,8 @@ pub struct AppState {
     pub next_retry: Mutex<Option<DateTime<Local>>>,
     pub last_weekly_attempt: Mutex<Option<String>>,
     pub next_weekly_retry: Mutex<Option<DateTime<Local>>>,
+    pub meeting_busy: AtomicBool,
+    pub asr_downloading: AtomicBool,
 }
 
 pub fn run() {
@@ -40,6 +43,7 @@ pub fn run() {
         ))
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&data_dir)?;
@@ -69,6 +73,8 @@ pub fn run() {
                 next_retry: Mutex::new(None),
                 last_weekly_attempt: Mutex::new(None),
                 next_weekly_retry: Mutex::new(None),
+                meeting_busy: AtomicBool::new(false),
+                asr_downloading: AtomicBool::new(false),
             });
 
             if let Err(e) = hotkey::apply_hotkey(app_handle, &settings.hotkey) {
@@ -106,7 +112,10 @@ pub fn run() {
             commands::delete_reminder,
             commands::set_reminder_enabled,
             commands::get_window_state,
-            commands::save_window_state
+            commands::save_window_state,
+            meeting::import_meeting_audio,
+            meeting::asr_model_status,
+            meeting::download_asr_model
         ])
         .run(tauri::generate_context!())
         .expect("运行马赛福失败");

@@ -316,6 +316,65 @@ input[type="checkbox"] {
   color: var(--btn-text);
 }
 
+.badge.meeting {
+  background: var(--ok);
+  color: var(--btn-text);
+}
+
+/* 会议导入：转动图标 + 进度条 */
+.spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--btn-soft);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  flex-shrink: 0;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.meeting-progress {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+}
+
+.progress-track {
+  flex: 1;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--btn-soft);
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  border-radius: 3px;
+  background: var(--accent);
+  transition: width 0.3s ease;
+}
+
+.progress-fill.indeterminate {
+  width: 30%;
+  animation: slide 1.2s ease-in-out infinite;
+}
+
+@keyframes slide {
+  0% {
+    margin-left: -30%;
+  }
+  100% {
+    margin-left: 100%;
+  }
+}
+
 .result-meta {
   display: flex;
   gap: 10px;
@@ -375,6 +434,23 @@ input[type="checkbox"] {
   display: flex;
   gap: 8px;
   flex-wrap: wrap;
+}
+
+/* 详情页「整理内容 / 原始内容」页签 */
+.detail-tabs {
+  display: flex;
+  gap: 6px;
+}
+
+.detail-tabs button.active {
+  background: var(--accent);
+  color: var(--btn-text);
+}
+
+.detail-clean {
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
 }
 
 .empty {
@@ -731,6 +807,43 @@ input[type="checkbox"] {
 
 .summary-content a:hover {
   text-decoration: underline;
+}
+
+.settings-body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+.settings-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: 132px;
+  flex-shrink: 0;
+  padding: 14px 10px;
+  border-right: 1px solid var(--border);
+}
+
+.settings-nav-item {
+  background: transparent;
+  color: var(--text-dim);
+  text-align: left;
+  padding: 8px 12px;
+  border-radius: 6px;
+  font-size: 13px;
+}
+
+.settings-nav-item:hover {
+  background: var(--bg-3);
+  color: var(--text);
+}
+
+.settings-nav-item.active {
+  background: var(--bg-3);
+  color: var(--text);
+  font-weight: 600;
+  box-shadow: inset 3px 0 0 var(--accent);
 }
 
 .settings-form {

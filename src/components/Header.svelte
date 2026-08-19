@@ -29,7 +29,7 @@
 <div class="header">
   <div class="drag" data-tauri-drag-region>
     <span class="app-title">马赛福</span>
-    <span class="app-subtitle">个人信息搜索和蒸馏工具 v1.0</span>
+    <span class="app-subtitle">个人信息搜索和蒸馏工具 v1.1</span>
   </div>
 
   {#if !compact}

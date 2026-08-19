@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { listen } from "@tauri-apps/api/event";
+  import { open } from "@tauri-apps/plugin-dialog";
   import { get } from "svelte/store";
   import { api, clipText, reminderRuleText, reminderStatus, sourceLabel, summaryTitle, today } from "../lib/api";
   import EntryDetail from "../components/EntryDetail.svelte";
@@ -37,6 +38,38 @@
   let generatingDate = "";
   let nowText = "";
   let todayCount = 0;
+  let importingMeeting = false;
+  let meetingStage = "";
+  let meetingProgress: number | null = null;
+
+  const MEETING_STAGE_LABEL: Record<string, string> = {
+    decoding: "解码音频中…",
+    transcribing: "语音识别中…",
+    minutes: "生成会议纪要中…",
+  };
+
+  async function importMeeting() {
+    const path = await open({
+      multiple: false,
+      filters: [{ name: "音频文件", extensions: ["mp3", "m4a", "wav", "ogg", "flac", "aac"] }],
+    });
+    if (!path) return;
+    importingMeeting = true;
+    meetingStage = "";
+    meetingProgress = null;
+    try {
+      await api.importMeetingAudio(path);
+      showToast("会议导入完成");
+      refreshStats();
+      refreshCurrent();
+    } catch (e) {
+      showToast(String(e));
+    } finally {
+      importingMeeting = false;
+      meetingStage = "";
+      meetingProgress = null;
+    }
+  }
 
   function tickClock() {
     const d = new Date();
@@ -118,9 +151,10 @@
     文章: "📄",
     链接: "🔗",
     待办: "✅",
+    会议: "🤝",
     其他: "📦",
   };
-  const SOURCE_ICON: Record<string, string> = { clipboard: "📋", manual: "✏️" };
+  const SOURCE_ICON: Record<string, string> = { clipboard: "📋", manual: "✏️", meeting: "🎙️" };
 
   onMount(async () => {
     await refreshStats();
@@ -146,6 +180,15 @@
     const unlistenStarted = listen<string>("summary-started", (e) => {
       generatingDate = e.payload;
     });
+    const unlistenMeeting = listen<{ stage: string; message: string; progress: number | null }>("meeting-progress", (e) => {
+      if (e.payload.stage === "done" || e.payload.stage === "error") {
+        meetingStage = "";
+        meetingProgress = null;
+      } else {
+        meetingStage = e.payload.message || MEETING_STAGE_LABEL[e.payload.stage] || "";
+        meetingProgress = e.payload.progress ?? null;
+      }
+    });
     const unlistenFailed = listen<string>("summary-failed", (e) => {
       if (generatingDate === e.payload) generatingDate = "";
     });
@@ -168,6 +211,7 @@
       unlisten.then((f) => f());
       unlistenSummary.then((f) => f());
       unlistenStarted.then((f) => f());
+      unlistenMeeting.then((f) => f());
       unlistenFailed.then((f) => f());
       unlisten2.then((f) => f());
     };
@@ -439,7 +483,7 @@
     {/each}
 
     <div class="tree-head"><span>来源</span></div>
-    {#each ["clipboard", "manual"] as s}
+    {#each ["clipboard", "manual", "meeting"] as s}
       {@const count = stats?.bySource.find((x) => x.key === s)?.count ?? 0}
       <div
         class="tree-item indent"
@@ -641,6 +685,26 @@
           <button class="primary" on:click={addInspiration} disabled={!newInspiration.trim()}>
             添加灵感
           </button>
+        </div>
+      {/if}
+      {#if selectedKey === "source:meeting" || selectedKey === "category:会议"}
+        <div style="display:flex;gap:8px;align-items:center;padding:10px 10px 0;flex-shrink:0;">
+          <button class="primary" on:click={importMeeting} disabled={importingMeeting}>
+            导入音频文件
+          </button>
+          {#if importingMeeting}
+            <span class="spinner"></span>
+            <div class="meeting-progress">
+              <span class="hint">{meetingStage || "准备导入…"}</span>
+              <div class="progress-track">
+                {#if meetingProgress != null}
+                  <div class="progress-fill" style="width:{Math.round(meetingProgress * 100)}%"></div>
+                {:else}
+                  <div class="progress-fill indeterminate"></div>
+                {/if}
+              </div>
+            </div>
+          {/if}
         </div>
       {/if}
       <div style="display:flex;gap:8px;padding:10px 10px 0;flex-shrink:0;">

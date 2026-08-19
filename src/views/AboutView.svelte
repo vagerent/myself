@@ -14,7 +14,7 @@
 <div class="about">
   <div class="logo">马赛福<span class="dot-accent">.</span></div>
   <div class="slogan">个人信息搜索和蒸馏工具</div>
-  <span class="badge version">v{version || "1.0.0"}</span>
+  <span class="badge version">v{version || "1.1.0"}</span>
 
   <p class="desc">
     常驻系统托盘的个人信息工具：自动收集剪贴板内容与手动记录的灵感，

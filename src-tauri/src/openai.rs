@@ -128,6 +128,54 @@ impl OpenAiClient {
         Ok(result)
     }
 
+    /// 根据会议转写文本生成结构化纪要，返回可复用的 ProcessedRow（category 固定为「会议」）。
+    /// template 为用户可配置的纪要要求；转写文本过长时保留头尾截断。
+    pub async fn meeting_minutes(
+        &self,
+        transcript: &str,
+        template: &str,
+    ) -> Result<ProcessedRow, String> {
+        const MAX_CHARS: usize = 15000;
+        let truncated: String = if transcript.chars().count() > MAX_CHARS {
+            let head: String = transcript.chars().take(MAX_CHARS / 2).collect();
+            let tail: String = transcript
+                .chars()
+                .rev()
+                .take(MAX_CHARS / 2)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            format!("{head}\n……（中间部分省略）……\n{tail}")
+        } else {
+            transcript.to_string()
+        };
+        let system = "你是「马赛福」的会议纪要助手。根据用户给出的纪要要求和会议转写文本生成会议纪要。只返回 JSON 对象，形如 {\"minutes\":\"...\",\"title\":\"...\",\"tags\":[\"a\",\"b\"]}，不要输出其他内容。其中 minutes 为 Markdown 格式的会议纪要正文，title 为 20 字以内的会议主题，tags 为 1-3 个中文标签。";
+        let user = format!("纪要要求：\n{template}\n\n会议转写文本：\n{truncated}");
+        let out = self.chat_json(system, &user).await?;
+        let minutes = out["minutes"].as_str().unwrap_or("").trim().to_string();
+        if minutes.is_empty() {
+            return Err("AI 未返回纪要内容".into());
+        }
+        let title = out["title"].as_str().unwrap_or("").trim().to_string();
+        let tags: Vec<String> = out["tags"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|t| t.as_str().map(|s| s.trim().to_string()))
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(ProcessedRow {
+            id: 0,
+            clean: minutes,
+            title,
+            category: "会议".into(),
+            tags,
+        })
+    }
+
     pub async fn entry_digests(&self, entries: &[EntryRow]) -> Result<HashMap<i64, String>, String> {
         let system = "为每条内容生成不超过 40 字的一句话摘要，保留关键信息。只返回 JSON 对象，形如 {\"1\":\"摘要\"}，不要输出其他内容。";
         let mut map = HashMap::new();

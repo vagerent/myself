@@ -238,9 +238,14 @@ pub fn open_url(url: String) -> Result<(), String> {
         return Err("仅支持 http/https 链接".into());
     }
     #[cfg(target_os = "windows")]
-    let result = std::process::Command::new("cmd")
-        .args(["/C", "start", "", &url])
-        .spawn();
+    let result = {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW：避免 GUI 程序拉起 cmd 时闪出黑色命令行窗口
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", &url])
+            .creation_flags(0x08000000)
+            .spawn()
+    };
     #[cfg(target_os = "macos")]
     let result = std::process::Command::new("open").arg(&url).spawn();
     #[cfg(all(unix, not(target_os = "macos")))]

@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { LogicalSize, PhysicalPosition, PhysicalSize } from "@tauri-apps/api/dpi";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import type { EntryPage, EntryRow, ReminderRow, SearchHit, Settings, SummaryRow, TreeStats } from "./types";
+import type { AsrModelStatus, EntryPage, EntryRow, ReminderRow, SearchHit, Settings, SummaryRow, TreeStats } from "./types";
 
 export interface WindowState {
   compactWidth?: number;
@@ -67,6 +67,9 @@ export const api = {
   deleteReminder: (id: number) => invoke<void>("delete_reminder", { id }),
   setReminderEnabled: (id: number, enabled: boolean) =>
     invoke<void>("set_reminder_enabled", { id, enabled }),
+  importMeetingAudio: (path: string) => invoke<EntryRow>("import_meeting_audio", { path }),
+  asrModelStatus: () => invoke<AsrModelStatus>("asr_model_status"),
+  downloadAsrModel: () => invoke<void>("download_asr_model"),
 };
 
 // 记住的窗口状态（精简/全量各自的大小 + 共用位置），启动时加载并缓存
@@ -113,6 +116,7 @@ export function sourceLabel(source: string): string {
       clipboard: "剪贴板",
       manual: "灵感",
       summary: "汇总",
+      meeting: "会议录音",
     }[source] ?? source
   );
 }
