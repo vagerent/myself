@@ -1,11 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
 import { LogicalSize, PhysicalPosition, PhysicalSize } from "@tauri-apps/api/dpi";
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import { availableMonitors, getCurrentWindow } from "@tauri-apps/api/window";
 import type { AsrModelStatus, EntryPage, EntryRow, ReminderRow, SearchHit, Settings, SummaryRow, TreeStats } from "./types";
 
 export interface WindowState {
-  compactWidth?: number;
-  compactHeight?: number;
   fullWidth?: number;
   fullHeight?: number;
   x?: number;
@@ -70,9 +68,11 @@ export const api = {
   importMeetingAudio: (path: string) => invoke<EntryRow>("import_meeting_audio", { path }),
   asrModelStatus: () => invoke<AsrModelStatus>("asr_model_status"),
   downloadAsrModel: () => invoke<void>("download_asr_model"),
+  generateDeepAnalysis: (entryId: number) =>
+    invoke<string>("generate_deep_analysis", { entryId }),
 };
 
-// 记住的窗口状态（精简/全量各自的大小 + 共用位置），启动时加载并缓存
+// 记住的窗口状态（大小 + 位置），启动时加载并缓存
 let winState: WindowState = {};
 
 export async function loadWindowState() {
@@ -87,27 +87,32 @@ export function setCachedWindowState(s: WindowState) {
   winState = s;
 }
 
-async function applyModeSize(mode: "compact" | "full", defW: number, defH: number) {
-  const w = mode === "compact" ? winState.compactWidth : winState.fullWidth;
-  const h = mode === "compact" ? winState.compactHeight : winState.fullHeight;
-  if (w && h) {
-    await win.setSize(new PhysicalSize(w, h));
-  } else {
-    await win.setSize(new LogicalSize(defW, defH));
+// 位置落在任一显示器范围内才恢复，否则居中（最小化时系统会记录屏幕外占位坐标）
+async function positionVisible(x: number, y: number): Promise<boolean> {
+  try {
+    const monitors = await availableMonitors();
+    return monitors.some((m) => {
+      const p = m.position;
+      const sz = m.size;
+      return x >= p.x - 8 && y >= p.y - 8 && x < p.x + sz.width && y < p.y + sz.height;
+    });
+  } catch {
+    return false;
   }
-  if (winState.x != null && winState.y != null) {
+}
+
+// 应用记住的窗口大小与位置（无记录时用默认全量尺寸）
+export async function setFullMode() {
+  if (winState.fullWidth && winState.fullHeight && winState.fullWidth >= 720 && winState.fullHeight >= 500) {
+    await win.setSize(new PhysicalSize(winState.fullWidth, winState.fullHeight));
+  } else {
+    await win.setSize(new LogicalSize(1080, 720));
+  }
+  if (winState.x != null && winState.y != null && (await positionVisible(winState.x, winState.y))) {
     await win.setPosition(new PhysicalPosition(winState.x, winState.y));
   } else {
     await win.center();
   }
-}
-
-export async function setCompactMode() {
-  await applyModeSize("compact", 760, 560);
-}
-
-export async function setFullMode() {
-  await applyModeSize("full", 1080, 720);
 }
 
 export function sourceLabel(source: string): string {
@@ -155,4 +160,24 @@ export function yesterday(): string {
   d.setDate(d.getDate() - 1);
   const p = (n: number) => String(n).padStart(2, "0");
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+// ISO 8601 周标识（与后端 iso_week 一致，格式 YYYY-Www）
+function isoWeekKey(d: Date): string {
+  const date = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+  const dayNum = date.getUTCDay() || 7;
+  date.setUTCDate(date.getUTCDate() + 4 - dayNum);
+  const yearStart = new Date(Date.UTC(date.getUTCFullYear(), 0, 1));
+  const week = Math.ceil(((date.getTime() - yearStart.getTime()) / 86400000 + 1) / 7);
+  return `${date.getUTCFullYear()}-W${String(week).padStart(2, "0")}`;
+}
+
+export function thisWeek(): string {
+  return isoWeekKey(new Date());
+}
+
+export function lastWeek(): string {
+  const d = new Date();
+  d.setDate(d.getDate() - 7);
+  return isoWeekKey(d);
 }

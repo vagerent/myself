@@ -43,7 +43,7 @@ pub fn build_tray(app: &AppHandle) -> tauri::Result<()> {
 
     TrayIconBuilder::with_id("main")
         .icon(icon)
-        .tooltip("马赛福 - 个人信息搜索和蒸馏工具 v1.1")
+        .tooltip("马赛福 - 个人数字分身 v1.2")
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {

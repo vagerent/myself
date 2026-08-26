@@ -13,6 +13,8 @@ pub struct EntryRow {
     pub id: i64,
     pub raw_content: String,
     pub clean_content: Option<String>,
+    /// 会议深度解析结果（AI 生成，Markdown），仅会议类条目使用
+    pub deep_analysis: Option<String>,
     pub title: Option<String>,
     pub category: Option<String>,
     pub tags: Option<String>,
@@ -100,7 +102,8 @@ pub fn init(conn: &Connection) -> rusqlite::Result<()> {
           source TEXT NOT NULL DEFAULT 'clipboard',
           processed INTEGER NOT NULL DEFAULT 0,
           created_at TEXT NOT NULL,
-          processed_at TEXT
+          processed_at TEXT,
+          deep_analysis TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_entries_created ON entries(created_at);
         CREATE INDEX IF NOT EXISTS idx_entries_processed ON entries(processed);
@@ -142,6 +145,24 @@ pub fn init(conn: &Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_reminders_next_fire ON reminders(enabled, next_fire_at);
         "#,
     )?;
+    ensure_column(conn, "entries", "deep_analysis", "TEXT")?;
+    Ok(())
+}
+
+/// 老库缺列时补列（CREATE TABLE IF NOT EXISTS 不会修改已有表）。
+fn ensure_column(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    decl: &str,
+) -> rusqlite::Result<()> {
+    let exists = conn
+        .prepare(&format!("PRAGMA table_info({table})"))?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .any(|name| name.as_deref() == Ok(column));
+    if !exists {
+        conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"), [])?;
+    }
     Ok(())
 }
 
@@ -295,18 +316,36 @@ fn row_to_entry(r: &rusqlite::Row<'_>) -> rusqlite::Result<EntryRow> {
         id: r.get(0)?,
         raw_content: r.get(1)?,
         clean_content: r.get(2)?,
-        title: r.get(3)?,
-        category: r.get(4)?,
-        tags: r.get(5)?,
-        source: r.get(6)?,
-        processed: r.get::<_, i64>(7)? != 0,
-        created_at: r.get(8)?,
-        processed_at: r.get(9)?,
+        deep_analysis: r.get(3)?,
+        title: r.get(4)?,
+        category: r.get(5)?,
+        tags: r.get(6)?,
+        source: r.get(7)?,
+        processed: r.get::<_, i64>(8)? != 0,
+        created_at: r.get(9)?,
+        processed_at: r.get(10)?,
     })
 }
 
-const ENTRY_COLS: &str =
-    "id, raw_content, clean_content, title, category, tags, source, processed, created_at, processed_at";
+const ENTRY_COLS: &str = "id, raw_content, clean_content, deep_analysis, title, category, tags, source, processed, created_at, processed_at";
+
+/// 保存条目的会议深度解析结果。
+pub fn save_deep_analysis(conn: &Connection, id: i64, analysis: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE entries SET deep_analysis = ?1 WHERE id = ?2",
+        params![analysis, id],
+    )?;
+    Ok(())
+}
+
+/// 仅更新条目标题（深度解析后为空标题补题用，不影响其他字段）。
+pub fn update_title(conn: &Connection, id: i64, title: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE entries SET title = ?1 WHERE id = ?2",
+        params![title, id],
+    )?;
+    Ok(())
+}
 
 pub fn get_entry(conn: &Connection, id: i64) -> rusqlite::Result<Option<EntryRow>> {
     conn.query_row(
@@ -981,6 +1020,35 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM entries", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn init_adds_deep_analysis_column_to_old_db() {
+        let conn = Connection::open_in_memory().unwrap();
+        // 模拟 v1.0 老库：entries 表没有 deep_analysis 列
+        conn.execute_batch(
+            "CREATE TABLE entries (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              raw_content TEXT NOT NULL,
+              content_hash TEXT NOT NULL UNIQUE,
+              clean_content TEXT,
+              title TEXT,
+              category TEXT,
+              tags TEXT,
+              source TEXT NOT NULL DEFAULT 'clipboard',
+              processed INTEGER NOT NULL DEFAULT 0,
+              created_at TEXT NOT NULL,
+              processed_at TEXT
+            );",
+        )
+        .unwrap();
+        init(&conn).unwrap();
+        // init 幂等：再跑一次不应报错
+        init(&conn).unwrap();
+        let id = insert_entry(&conn, "会议内容", "meeting", true).unwrap().unwrap();
+        save_deep_analysis(&conn, id, "# 深度解析").unwrap();
+        let row = get_entry(&conn, id).unwrap().unwrap();
+        assert_eq!(row.deep_analysis.as_deref(), Some("# 深度解析"));
     }
 
     #[test]

@@ -16,12 +16,15 @@ export interface Settings {
   weeklyPromptTemplate: string;
   dedupScope: string;
   meetingPromptTemplate: string;
+  meetingDeepPromptTemplate: string;
+  clipboardEnabled: boolean;
 }
 
 export interface EntryRow {
   id: number;
   rawContent: string;
   cleanContent: string | null;
+  deepAnalysis: string | null;
   title: string | null;
   category: string | null;
   tags: string | null;

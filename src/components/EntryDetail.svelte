@@ -21,9 +21,41 @@
 
   // 有 AI 整理内容且与原文不同时，用页签切换「整理内容 / 原始内容」
   // （组件按 entry.id 重建，创建时确定即可）
+  const isMeeting = entry.source === "meeting";
   const hasClean = !!entry.cleanContent && entry.cleanContent !== entry.rawContent;
-  const cleanLabel = entry.source === "meeting" ? "会议纪要" : "整理后内容";
-  let tab: "clean" | "raw" = hasClean ? "clean" : "raw";
+  const cleanLabel = isMeeting ? "会议纪要" : "整理后内容";
+  let tab: "clean" | "raw" | "deep" = hasClean ? "clean" : "raw";
+
+  // 深度解析：结果落库，生成过程在后台进行，期间可切换到其他页面
+  let deep = entry.deepAnalysis ?? "";
+  let deepLoading = false;
+
+  async function generateDeep() {
+    if (
+      !confirm(
+        "深度解析会调用 AI 对会议转写全文做结构化分析（议题、决策、行动项、思维导图），大约需要一两分钟。是否开始？",
+      )
+    ) {
+      return;
+    }
+    deepLoading = true;
+    try {
+      deep = await api.generateDeepAnalysis(entry.id);
+      // 后端在标题为空时会根据解析结果补题，重新拉取同步过来
+      if (!title.trim()) {
+        const fresh = await api.getEntry(entry.id).catch(() => null);
+        if (fresh?.title) {
+          title = fresh.title;
+          onSaved();
+        }
+      }
+      showToast("深度解析已生成");
+    } catch (e) {
+      showToast("深度解析失败：" + String(e));
+    } finally {
+      deepLoading = false;
+    }
+  }
 
   async function save() {
     try {
@@ -35,10 +67,15 @@
     }
   }
 
+  function currentText(): string {
+    if (tab === "deep") return deep;
+    if (hasClean && tab === "clean") return entry.cleanContent ?? "";
+    return entry.rawContent;
+  }
+
   async function copy() {
-    const text = hasClean && tab === "clean" ? (entry.cleanContent ?? "") : entry.rawContent;
     try {
-      await api.copyText(text);
+      await api.copyText(currentText());
       showToast("已复制到剪贴板");
     } catch (e) {
       showToast("复制失败：" + String(e));
@@ -77,30 +114,64 @@
       </div>
     </div>
   {/if}
-  {#if hasClean}
+  {#if hasClean || isMeeting}
     <div class="detail-tabs">
-      <button type="button" class:active={tab === "clean"} on:click={() => (tab = "clean")}>
-        {cleanLabel}
-      </button>
+      {#if hasClean}
+        <button type="button" class:active={tab === "clean"} on:click={() => (tab = "clean")}>
+          {cleanLabel}
+        </button>
+      {/if}
       <button type="button" class:active={tab === "raw"} on:click={() => (tab = "raw")}>
         原始内容
       </button>
+      {#if isMeeting}
+        <button type="button" class:active={tab === "deep"} on:click={() => (tab = "deep")}>
+          深度解析
+        </button>
+      {/if}
     </div>
   {/if}
-  {#if hasClean && tab === "clean"}
+  {#if tab === "deep" && isMeeting}
+    {#if deepLoading}
+      <div class="deep-panel">
+        <span class="spinner"></span>
+        <span class="hint">正在生成深度解析，大约需要一两分钟；期间可以正常切换到其他页面。</span>
+      </div>
+    {:else if deep}
+      <div style="display:flex;justify-content:flex-end;">
+        <button type="button" on:click={generateDeep}>重新生成</button>
+      </div>
+      <div class="summary-content detail-clean">
+        {@html renderMarkdown(deep)}
+      </div>
+    {:else}
+      <div class="deep-panel">
+        <span class="hint">
+          基于会议转写全文，由 AI 生成决策导向的深度纪要：议题拆解、决策与未决项、行动项清单、业务思维导图。
+        </span>
+        <button class="primary" on:click={generateDeep}>生成深度解析</button>
+      </div>
+    {/if}
+  {:else if hasClean && tab === "clean"}
     <div class="summary-content detail-clean">
       {@html renderMarkdown(entry.cleanContent ?? "")}
     </div>
   {:else}
-    {#if !hasClean}
+    {#if !hasClean && !isMeeting}
       <label style="color:var(--text-dim);font-size:12px;">原始内容</label>
     {/if}
     <textarea readonly value={entry.rawContent} style="flex:1;"></textarea>
   {/if}
   <div class="detail-actions">
     <button class="primary" on:click={save}>保存</button>
-    <button on:click={copy}>
-      {hasClean && tab === "clean" ? (entry.source === "meeting" ? "复制纪要" : "复制整理内容") : "复制原文"}
+    <button on:click={copy} disabled={tab === "deep" && !deep}>
+      {#if tab === "deep"}
+        复制解析
+      {:else if hasClean && tab === "clean"}
+        {isMeeting ? "复制纪要" : "复制整理内容"}
+      {:else}
+        复制原文
+      {/if}
     </button>
     <button on:click={onBack}>返回</button>
   </div>

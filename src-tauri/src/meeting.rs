@@ -371,6 +371,61 @@ async fn import_inner(app: &AppHandle, path: &str) -> Result<db::EntryRow, Strin
     }
 }
 
+/// 生成会议深度解析（异步后台执行，不阻塞 UI；结果落库后返回）。
+/// 同一时间只允许一个解析任务，避免并发打爆 API。
+#[tauri::command]
+pub async fn generate_deep_analysis(app: AppHandle, entry_id: i64) -> Result<String, String> {
+    {
+        let state = app.state::<AppState>();
+        if state.deep_busy.swap(true, Ordering::SeqCst) {
+            return Err("已有深度解析任务进行中".into());
+        }
+    }
+    let result = deep_analysis_inner(&app, entry_id).await;
+    app.state::<AppState>()
+        .deep_busy
+        .store(false, Ordering::SeqCst);
+    result
+}
+
+async fn deep_analysis_inner(app: &AppHandle, entry_id: i64) -> Result<String, String> {
+    let (transcript, title_missing, settings) = {
+        let state = app.state::<AppState>();
+        let s = state.settings.lock().map_err(|e| e.to_string())?.clone();
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        let row = db::get_entry(&conn, entry_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "条目不存在".to_string())?;
+        let missing = row.title.as_deref().map(str::trim).unwrap_or("").is_empty();
+        (row.raw_content, missing, s)
+    };
+    if !settings.api_key_present() {
+        return Err("请先在「设置 → AI 服务」中配置 API Key".into());
+    }
+    let client = OpenAiClient::new(&settings.base_url, &settings.api_key, &settings.model);
+    let analysis = client
+        .meeting_deep_analysis(&transcript, &settings.meeting_deep_prompt_template)
+        .await?;
+    {
+        let state = app.state::<AppState>();
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        db::save_deep_analysis(&conn, entry_id, &analysis).map_err(|e| e.to_string())?;
+    }
+    // 标题为空时（纪要未生成或生成失败），根据解析结果补一个标题；
+    // 补题失败不影响解析结果，只记日志。
+    if title_missing {
+        match client.generate_title(&analysis).await {
+            Ok(title) => {
+                let state = app.state::<AppState>();
+                let conn = state.db.lock().map_err(|e| e.to_string())?;
+                db::update_title(&conn, entry_id, &title).map_err(|e| e.to_string())?;
+            }
+            Err(e) => log::warn!("会议 {entry_id} 深度解析后补标题失败: {e}"),
+        }
+    }
+    Ok(analysis)
+}
+
 /// 启动 sidecar 并流式消费 stderr：协议行（MASAIFU_PROGRESS / MASAIFU_LOG）转成
 /// 前端进度事件，其余行保留最后一行作错误诊断。stdout 并发排空，避免长转写撑满
 /// 管道缓冲导致子进程阻塞。

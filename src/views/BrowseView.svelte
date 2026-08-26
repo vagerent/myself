@@ -3,7 +3,7 @@
   import { listen } from "@tauri-apps/api/event";
   import { open } from "@tauri-apps/plugin-dialog";
   import { get } from "svelte/store";
-  import { api, clipText, reminderRuleText, reminderStatus, sourceLabel, summaryTitle, today } from "../lib/api";
+  import { api, clipText, lastWeek, reminderRuleText, reminderStatus, sourceLabel, summaryTitle, thisWeek, today } from "../lib/api";
   import EntryDetail from "../components/EntryDetail.svelte";
   import Pagination from "../components/Pagination.svelte";
   import ReminderDetail from "../components/ReminderDetail.svelte";
@@ -41,6 +41,9 @@
   let importingMeeting = false;
   let meetingStage = "";
   let meetingProgress: number | null = null;
+  let summaryDate = today();
+  let weekChoice: "last" | "this" = "last";
+  $: weekKey = weekChoice === "last" ? lastWeek() : thisWeek();
 
   const MEETING_STAGE_LABEL: Record<string, string> = {
     decoding: "解码音频中…",
@@ -625,6 +628,34 @@
         pageSize={PAGE_SIZE}
       />
     {:else if selectedKey === "sumdaily" || selectedKey === "sumweekly"}
+      {#if selectedKey === "sumdaily"}
+        <div style="display:flex;align-items:center;gap:10px;padding:10px 10px 0;flex-shrink:0;">
+          <input type="date" bind:value={summaryDate} style="width:150px;" />
+          <button
+            class="primary"
+            on:click={() => rerun(summaryDate)}
+            disabled={!summaryDate || rerunning || generatingDate === summaryDate}
+          >
+            {rerunning || generatingDate === summaryDate ? "生成中…" : "立即汇总"}
+          </button>
+          <span class="hint">选择日期，基于当天已收集的条目生成每日汇总</span>
+        </div>
+      {:else}
+        <div style="display:flex;align-items:center;gap:10px;padding:10px 10px 0;flex-shrink:0;">
+          <select bind:value={weekChoice} style="width:180px;">
+            <option value="last">上周（{lastWeek()}）</option>
+            <option value="this">本周（{thisWeek()}）</option>
+          </select>
+          <button
+            class="primary"
+            on:click={() => rerun(weekKey)}
+            disabled={rerunning || generatingDate === weekKey}
+          >
+            {rerunning || generatingDate === weekKey ? "生成中…" : "立即汇总"}
+          </button>
+          <span class="hint">汇总所选周（周一至周日）的条目</span>
+        </div>
+      {/if}
       <div class="results" style="padding:10px;">
         {#each selectedKey === "sumdaily" ? pagedDaily : pagedWeekly as s (s.date)}
           <button type="button" class="result-item" on:click={() => selectSummaryDate(s.date)}>

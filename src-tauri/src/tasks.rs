@@ -37,7 +37,11 @@ async fn clipboard_loop(app: AppHandle) {
         let s = settings_of(&app);
         let interval = s.poll_interval_ms.max(200);
         let dedup_daily = s.dedup_scope != "all";
+        let enabled = s.clipboard_enabled;
         tokio::time::sleep(StdDuration::from_millis(interval)).await;
+        if !enabled {
+            continue;
+        }
         let mut cb = match arboard::Clipboard::new() {
             Ok(c) => c,
             Err(_) => continue,

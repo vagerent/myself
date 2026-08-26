@@ -1,9 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { listen } from "@tauri-apps/api/event";
-  import { get } from "svelte/store";
   import Header from "./components/Header.svelte";
-  import SearchView from "./views/SearchView.svelte";
   import BrowseView from "./views/BrowseView.svelte";
   import SettingsView from "./views/SettingsView.svelte";
   import AboutView from "./views/AboutView.svelte";
@@ -12,40 +10,17 @@
     getCachedWindowState,
     loadWindowState,
     setCachedWindowState,
-    setCompactMode,
     setFullMode,
     win,
   } from "./lib/api";
-  import { loadSettings, mode, pendingReminderFocus, toast, view } from "./lib/stores";
+  import { loadSettings, pendingReminderFocus, toast, view } from "./lib/stores";
   import { watchSystemTheme } from "./lib/theme";
-
-  let compact = true;
-  $: mode.set(compact ? "compact" : "full");
 
   type AppAlert = { heading: string; title: string; note: string };
   let appAlerts: AppAlert[] = [];
   $: currentAlert = appAlerts.length > 0 ? appAlerts[0] : null;
 
-  function maximize() {
-    compact = false;
-    view.set("browse");
-    setFullMode();
-  }
-
-  function restore() {
-    compact = true;
-    view.set("search");
-    setCompactMode();
-  }
-
-  function openCompactSearch() {
-    compact = true;
-    view.set("search");
-    setCompactMode();
-  }
-
-  function openFullView(v: "browse" | "settings" | "about") {
-    compact = false;
+  function openView(v: "browse" | "settings" | "about") {
     view.set(v);
     setFullMode();
   }
@@ -60,17 +35,14 @@
 
   async function persistWindowState() {
     if (await win.isMaximized().catch(() => false)) return;
-    const m = get(mode);
+    // 最小化时系统报告的位置/尺寸是屏幕外占位值（如 -32000），不能入库
+    if (await win.isMinimized().catch(() => false)) return;
     const size = await win.innerSize();
     const pos = await win.outerPosition();
+    if (pos.x < -10000 || pos.y < -10000) return;
     const s = { ...getCachedWindowState() };
-    if (m === "compact") {
-      s.compactWidth = size.width;
-      s.compactHeight = size.height;
-    } else {
-      s.fullWidth = size.width;
-      s.fullHeight = size.height;
-    }
+    s.fullWidth = size.width;
+    s.fullHeight = size.height;
     s.x = pos.x;
     s.y = pos.y;
     setCachedWindowState(s);
@@ -84,20 +56,20 @@
     const unResized = win.onResized(scheduleSaveWindowState);
     const unMoved = win.onMoved(scheduleSaveWindowState);
     const un1 = listen("focus-search", () => {
-      openCompactSearch();
+      openView("browse");
     });
     const un2 = listen("show-settings", () => {
-      openFullView("settings");
+      openView("settings");
     });
     const un3 = listen("show-summary", () => {
-      openFullView("browse");
+      openView("browse");
     });
     const un4 = listen("show-reminders", () => {
       pendingReminderFocus.set(true);
-      openFullView("browse");
+      openView("browse");
     });
     const un5 = listen("show-about", () => {
-      openFullView("about");
+      openView("about");
     });
     const un6 = listen<AppAlert>("app-alert", (e) => {
       appAlerts = [...appAlerts, e.payload];
@@ -128,15 +100,10 @@
 </script>
 
 <div class="app-shell">
-  <Header
-    compact={compact}
-    onToggleMode={compact ? maximize : restore}
-  />
+  <Header />
 
   <div class="content">
-    {#if $view === "search"}
-      <SearchView />
-    {:else if $view === "browse"}
+    {#if $view === "browse"}
       <BrowseView />
     {:else if $view === "about"}
       <AboutView />

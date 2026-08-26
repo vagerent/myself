@@ -3,11 +3,9 @@ import { api } from "./api";
 import { applyTheme } from "./theme";
 import type { Settings } from "./types";
 
-export type Mode = "compact" | "full";
-export type View = "search" | "browse" | "settings" | "about";
+export type View = "browse" | "settings" | "about";
 
-export const mode = writable<Mode>("compact");
-export const view = writable<View>("search");
+export const view = writable<View>("browse");
 export const settings = writable<Settings | null>(null);
 export const toast = writable<string | null>(null);
 /** 托盘「任务提醒」进入时置 true，BrowseView 消费后置 false。 */

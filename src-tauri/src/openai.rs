@@ -135,21 +135,7 @@ impl OpenAiClient {
         transcript: &str,
         template: &str,
     ) -> Result<ProcessedRow, String> {
-        const MAX_CHARS: usize = 15000;
-        let truncated: String = if transcript.chars().count() > MAX_CHARS {
-            let head: String = transcript.chars().take(MAX_CHARS / 2).collect();
-            let tail: String = transcript
-                .chars()
-                .rev()
-                .take(MAX_CHARS / 2)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect();
-            format!("{head}\n……（中间部分省略）……\n{tail}")
-        } else {
-            transcript.to_string()
-        };
+        let truncated = truncate_middle(transcript, 15000);
         let system = "你是「马赛福」的会议纪要助手。根据用户给出的纪要要求和会议转写文本生成会议纪要。只返回 JSON 对象，形如 {\"minutes\":\"...\",\"title\":\"...\",\"tags\":[\"a\",\"b\"]}，不要输出其他内容。其中 minutes 为 Markdown 格式的会议纪要正文，title 为 20 字以内的会议主题，tags 为 1-3 个中文标签。";
         let user = format!("纪要要求：\n{template}\n\n会议转写文本：\n{truncated}");
         let out = self.chat_json(system, &user).await?;
@@ -174,6 +160,38 @@ impl OpenAiClient {
             category: "会议".into(),
             tags,
         })
+    }
+
+    /// 会议深度解析：template 是完整的 system 提示词，转写文本作为用户消息。
+    /// 直接返回 Markdown 文本（不走 JSON 结构化）。
+    pub async fn meeting_deep_analysis(
+        &self,
+        transcript: &str,
+        template: &str,
+    ) -> Result<String, String> {
+        let truncated = truncate_middle(transcript, 15000);
+        let user = format!("会议转写文本：\n{truncated}");
+        let out = self.chat(template, &user).await?;
+        let out = out.trim().to_string();
+        if out.is_empty() {
+            return Err("AI 未返回深度解析内容".into());
+        }
+        Ok(out)
+    }
+
+    /// 根据已有内容（如深度解析结果）补一个 20 字以内的标题，返回纯文本。
+    pub async fn generate_title(&self, content: &str) -> Result<String, String> {
+        let truncated = truncate_middle(content, 8000);
+        let system = "你是「马赛福」的标题助手。根据用户给出的内容提取一个 20 字以内的标题，只输出标题本身，不要引号、标点结尾或其他内容。";
+        let out = self.chat(system, &truncated).await?;
+        let title = out
+            .trim()
+            .trim_matches(|c| matches!(c, '"' | '\'' | '“' | '”'))
+            .to_string();
+        if title.is_empty() {
+            return Err("AI 未返回标题".into());
+        }
+        Ok(title)
     }
 
     pub async fn entry_digests(&self, entries: &[EntryRow]) -> Result<HashMap<i64, String>, String> {
@@ -231,6 +249,23 @@ impl ProcessedRow {
     pub fn tags_json(&self) -> String {
         serde_json::to_string(&self.tags).unwrap_or_else(|_| "[]".into())
     }
+}
+
+/// 长文本保留头尾截断（转写全文可能超出模型上下文）。
+fn truncate_middle(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let head: String = text.chars().take(max_chars / 2).collect();
+    let tail: String = text
+        .chars()
+        .rev()
+        .take(max_chars / 2)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{head}\n……（中间部分省略）……\n{tail}")
 }
 
 fn trim_json(s: &str) -> &str {

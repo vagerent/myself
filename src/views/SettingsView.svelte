@@ -23,6 +23,8 @@
     weeklyPromptTemplate: "",
     dedupScope: "day",
     meetingPromptTemplate: "",
+    meetingDeepPromptTemplate: "",
+    clipboardEnabled: true,
   };
   let saving = false;
   let asrStatus: AsrModelStatus | null = null;
@@ -197,6 +199,12 @@
       </div>
 
       <div class="field">
+        <label>会议深度解析提示词模板</label>
+        <textarea bind:value={form.meetingDeepPromptTemplate} rows="10"></textarea>
+        <span class="hint">作为系统提示词整体发给模型，会议转写全文作为用户消息。在条目详情的「深度解析」页签中使用。</span>
+      </div>
+
+      <div class="field">
         <label>语音识别模型</label>
         <div class="field-row">
           {#if asrStatus}
@@ -237,6 +245,10 @@
           <label style="display:flex;gap:6px;align-items:center;">
             <input type="checkbox" bind:checked={form.autostart} />
             开机自启
+          </label>
+          <label style="display:flex;gap:6px;align-items:center;">
+            <input type="checkbox" bind:checked={form.clipboardEnabled} />
+            监控剪贴板（关闭后停止自动收集）
           </label>
         </div>
       </div>

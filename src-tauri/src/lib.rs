@@ -27,6 +27,7 @@ pub struct AppState {
     pub next_weekly_retry: Mutex<Option<DateTime<Local>>>,
     pub meeting_busy: AtomicBool,
     pub asr_downloading: AtomicBool,
+    pub deep_busy: AtomicBool,
 }
 
 pub fn run() {
@@ -75,6 +76,7 @@ pub fn run() {
                 next_weekly_retry: Mutex::new(None),
                 meeting_busy: AtomicBool::new(false),
                 asr_downloading: AtomicBool::new(false),
+                deep_busy: AtomicBool::new(false),
             });
 
             if let Err(e) = hotkey::apply_hotkey(app_handle, &settings.hotkey) {
@@ -115,7 +117,8 @@ pub fn run() {
             commands::save_window_state,
             meeting::import_meeting_audio,
             meeting::asr_model_status,
-            meeting::download_asr_model
+            meeting::download_asr_model,
+            meeting::generate_deep_analysis
         ])
         .run(tauri::generate_context!())
         .expect("运行马赛福失败");
