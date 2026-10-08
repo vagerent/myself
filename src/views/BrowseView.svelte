@@ -54,7 +54,7 @@
   async function importMeeting() {
     const path = await open({
       multiple: false,
-      filters: [{ name: "音频文件", extensions: ["mp3", "m4a", "wav", "ogg", "flac", "aac"] }],
+      filters: [{ name: "音频文件", extensions: ["mp3", "m4a", "wav", "ogg", "opus", "flac", "aac"] }],
     });
     if (!path) return;
     importingMeeting = true;
@@ -684,6 +684,12 @@
           onSaved={() => {
             current = null;
             refreshCurrent();
+          }}
+          onDeleted={() => {
+            current = null;
+            refreshCurrent();
+            refreshStats();
+            showToast("已删除");
           }}
           onBack={() => {
             current = null;

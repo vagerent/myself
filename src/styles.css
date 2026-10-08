@@ -145,6 +145,16 @@ button.primary:disabled {
   transform: none;
 }
 
+button.danger {
+  border-color: var(--err);
+  color: var(--err);
+}
+
+button.danger:hover {
+  background: rgba(224, 108, 117, 0.12);
+  border-color: var(--err);
+}
+
 button.icon-btn {
   background: transparent;
   border: none;

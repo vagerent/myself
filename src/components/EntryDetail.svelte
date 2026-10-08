@@ -3,10 +3,12 @@
   import { showToast } from "../lib/stores";
   import { CATEGORIES, type EntryRow } from "../lib/types";
   import { renderMarkdown } from "../lib/markdown";
+  import SpeakBar from "./SpeakBar.svelte";
 
   export let entry: EntryRow;
   export let onSaved: () => void;
   export let onBack: () => void;
+  export let onDeleted: () => void;
 
   let title = entry.title ?? "";
   let category = entry.category ?? "";
@@ -29,6 +31,9 @@
   // 深度解析：结果落库，生成过程在后台进行，期间可切换到其他页面
   let deep = entry.deepAnalysis ?? "";
   let deepLoading = false;
+
+  // 朗读面板：点页签行右侧喇叭图标展开
+  let showSpeak = false;
 
   async function generateDeep() {
     if (
@@ -64,6 +69,19 @@
       onSaved();
     } catch (e) {
       showToast("保存失败：" + String(e));
+    }
+  }
+
+  async function remove() {
+    if (!confirm("确定删除这条记录吗？删除后不可恢复。")) {
+      return;
+    }
+    try {
+      await api.deleteEntry(entry.id);
+      showToast("已删除");
+      onDeleted();
+    } catch (e) {
+      showToast("删除失败：" + String(e));
     }
   }
 
@@ -128,8 +146,21 @@
         <button type="button" class:active={tab === "deep"} on:click={() => (tab = "deep")}>
           深度解析
         </button>
+        <button
+          type="button"
+          class="speak-toggle"
+          style="margin-left:auto;"
+          class:active={showSpeak}
+          title="朗读"
+          on:click={() => (showSpeak = !showSpeak)}
+        >
+          🔊
+        </button>
       {/if}
     </div>
+  {/if}
+  {#if isMeeting && showSpeak}
+    <SpeakBar entryId={entry.id} {tab} />
   {/if}
   {#if tab === "deep" && isMeeting}
     {#if deepLoading}
@@ -138,9 +169,6 @@
         <span class="hint">正在生成深度解析，大约需要一两分钟；期间可以正常切换到其他页面。</span>
       </div>
     {:else if deep}
-      <div style="display:flex;justify-content:flex-end;">
-        <button type="button" on:click={generateDeep}>重新生成</button>
-      </div>
       <div class="summary-content detail-clean">
         {@html renderMarkdown(deep)}
       </div>
@@ -174,5 +202,9 @@
       {/if}
     </button>
     <button on:click={onBack}>返回</button>
+    <button class="danger" style="margin-left:auto;" on:click={remove}>删除</button>
+    {#if isMeeting && tab === "deep" && deep && !deepLoading}
+      <button type="button" style="margin-left:auto;" on:click={generateDeep}>重新生成深度解析</button>
+    {/if}
   </div>
 </div>

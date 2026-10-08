@@ -2,8 +2,11 @@
 """马赛福会议录音转写组件（funasr-onnx sidecar）。
 
 用法：
-    transcribe --model-dir <ASR模型目录> --vad-dir <VAD模型目录> --audio <16kHz 单声道 wav>
+    transcribe --model-dir <ASR模型目录> --vad-dir <VAD模型目录> --audio <音频文件>
                [--spk-dir <说话人模型目录>]
+
+--audio 接受 soundfile 支持的格式（wav/ogg/opus/flac 等），内部统一为 16kHz 单声道；
+非 16kHz 输入做线性插值重采样（ASR 输入够用，避免引入 scipy 依赖）。
 
 流程：Fsmn_vad 按静音点切出语音段 → （可选）CAM++ 逐段提取声纹 embedding 并聚类
 出「说话人N」→ 相邻同说话人语音段拼成 ≤30 秒的块 → 逐块送 SenseVoiceSmall 转写。
@@ -108,6 +111,18 @@ def cluster_speakers(embs, threshold: float):
     return labels
 
 
+def resample_linear(mono, sr: int, target_sr: int = 16000):
+    """线性插值重采样。只用于把 ASR 输入统一到 16kHz，无需 scipy 的高质量滤波。"""
+    import numpy as np
+
+    if sr == target_sr or len(mono) == 0:
+        return mono
+    n = max(1, int(round(len(mono) * target_sr / sr)))
+    x_old = np.linspace(0.0, 1.0, num=len(mono), endpoint=False)
+    x_new = np.linspace(0.0, 1.0, num=n, endpoint=False)
+    return np.interp(x_new, x_old, mono).astype(np.float32, copy=False)
+
+
 def fmt_time(secs: float) -> str:
     secs = int(secs)
     h, rem = divmod(secs, 3600)
@@ -135,6 +150,10 @@ def main() -> int:
 
     wav, sr = sf.read(args.audio, dtype="float32", always_2d=True)
     mono = wav.mean(axis=1)
+    if sr != 16000:
+        log(f"音频采样率 {sr}Hz，重采样为 16000Hz")
+        mono = resample_linear(mono, sr)
+        sr = 16000
     total_secs = len(mono) / sr
     if total_secs <= 0:
         print(json.dumps({"text": "", "segments": []}, ensure_ascii=False))

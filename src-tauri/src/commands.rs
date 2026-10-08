@@ -116,6 +116,12 @@ pub fn get_entry(state: State<'_, AppState>, id: i64) -> Result<db::EntryRow, St
 }
 
 #[tauri::command]
+pub fn delete_entry(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    db::delete_entry(&conn, id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub fn list_summaries(state: State<'_, AppState>) -> Result<Vec<db::SummaryRow>, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     db::list_summaries(&conn).map_err(|e| e.to_string())

@@ -6,6 +6,7 @@ mod openai;
 mod settings;
 mod tasks;
 mod tray;
+mod tts;
 mod winstate;
 
 use chrono::{DateTime, Local};
@@ -28,11 +29,26 @@ pub struct AppState {
     pub meeting_busy: AtomicBool,
     pub asr_downloading: AtomicBool,
     pub deep_busy: AtomicBool,
+    pub tts_downloading: AtomicBool,
+    pub tts_speaking: AtomicBool,
+    pub tts_cancel: AtomicBool,
+    /// 当前朗读任务的 sidecar 子进程句柄，供停止命令 kill
+    pub tts_child: Mutex<Option<tokio::process::Child>>,
 }
 
 pub fn run() {
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .try_init();
+
+    // WebView2 默认的自动播放策略会拦截没有用户手势的音频播放（朗读是合成完一句
+    // 播一句，后续句子没有手势上下文），通过追加浏览器参数放开
+    #[cfg(windows)]
+    unsafe {
+        std::env::set_var(
+            "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
+            "--autoplay-policy=no-user-gesture-required",
+        );
+    }
 
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -77,6 +93,10 @@ pub fn run() {
                 meeting_busy: AtomicBool::new(false),
                 asr_downloading: AtomicBool::new(false),
                 deep_busy: AtomicBool::new(false),
+                tts_downloading: AtomicBool::new(false),
+                tts_speaking: AtomicBool::new(false),
+                tts_cancel: AtomicBool::new(false),
+                tts_child: Mutex::new(None),
             });
 
             if let Err(e) = hotkey::apply_hotkey(app_handle, &settings.hotkey) {
@@ -98,6 +118,7 @@ pub fn run() {
             commands::add_entry,
             commands::update_entry,
             commands::get_entry,
+            commands::delete_entry,
             commands::list_summaries,
             commands::get_tree_stats,
             commands::list_entries_filtered,
@@ -118,7 +139,12 @@ pub fn run() {
             meeting::import_meeting_audio,
             meeting::asr_model_status,
             meeting::download_asr_model,
-            meeting::generate_deep_analysis
+            meeting::generate_deep_analysis,
+            tts::tts_model_status,
+            tts::download_tts_model,
+            tts::meeting_speak,
+            tts::meeting_stop_speak,
+            tts::tts_read_wav
         ])
         .run(tauri::generate_context!())
         .expect("运行马赛福失败");
