@@ -1,14 +1,21 @@
 node_modules
 dist
 .venv-sidecar
+.venv-tts
 models
 # PyInstaller 中间产物（sidecar 重冻时重新生成）
 build/
 transcribe.spec
+tts.spec
+pnote.spec
 src-tauri/target
 src-tauri/gen
 src-tauri/resources/funasr-sidecar/*
 !src-tauri/resources/funasr-sidecar/README.txt
+src-tauri/resources/tts-sidecar/*
+src-tauri/resources/pnote-sidecar/*
+!src-tauri/resources/pnote-sidecar/README.txt
+.venv-pnote/
 html
 *.log
 .DS_Store
