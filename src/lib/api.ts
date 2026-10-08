@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { LogicalSize, PhysicalPosition, PhysicalSize } from "@tauri-apps/api/dpi";
 import { availableMonitors, getCurrentWindow } from "@tauri-apps/api/window";
-import type { AsrModelStatus, EntryPage, EntryRow, ReminderRow, SearchHit, Settings, SummaryRow, TreeStats } from "./types";
+import type { AsrModelStatus, EntryPage, EntryRow, PnoteStatus, ReminderRow, SearchHit, Settings, SummaryRow, TreeStats } from "./types";
 
 export interface WindowState {
   fullWidth?: number;
@@ -70,6 +70,10 @@ export const api = {
   downloadAsrModel: () => invoke<void>("download_asr_model"),
   generateDeepAnalysis: (entryId: number) =>
     invoke<string>("generate_deep_analysis", { entryId }),
+  pnoteStatus: () => invoke<PnoteStatus>("pnote_status"),
+  pnoteSyncNow: () => invoke<void>("pnote_sync_now"),
+  pnoteFileList: () => invoke<unknown>("pnote_file_list"),
+  pnoteSetEnabled: (enabled: boolean) => invoke<void>("pnote_set_enabled", { enabled }),
 };
 
 // 记住的窗口状态（大小 + 位置），启动时加载并缓存
@@ -122,6 +126,7 @@ export function sourceLabel(source: string): string {
       manual: "灵感",
       summary: "汇总",
       meeting: "会议录音",
+      recorder: "录音卡",
     }[source] ?? source
   );
 }

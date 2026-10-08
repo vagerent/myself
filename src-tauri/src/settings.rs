@@ -146,6 +146,12 @@ pub struct Settings {
     pub meeting_deep_prompt_template: String,
     /// 是否监控剪贴板（false 时停止自动收集）
     pub clipboard_enabled: bool,
+    /// 录音卡同步开关（false 时不启动常驻 sidecar）
+    pub pnote_enabled: bool,
+    /// 录音卡 OGG 归档本地保留天数
+    pub pnote_keep_days: i64,
+    /// ffmpeg 路径（留空则不校验时长，转写兜底）
+    pub pnote_ffmpeg_path: String,
 }
 
 impl Default for Settings {
@@ -170,6 +176,9 @@ impl Default for Settings {
             meeting_prompt_template: DEFAULT_MEETING_PROMPT_TEMPLATE.into(),
             meeting_deep_prompt_template: DEFAULT_MEETING_DEEP_PROMPT_TEMPLATE.into(),
             clipboard_enabled: true,
+            pnote_enabled: false,
+            pnote_keep_days: 30,
+            pnote_ffmpeg_path: String::new(),
         }
     }
 }

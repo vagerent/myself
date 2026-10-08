@@ -18,6 +18,20 @@ export interface Settings {
   meetingPromptTemplate: string;
   meetingDeepPromptTemplate: string;
   clipboardEnabled: boolean;
+  pnoteEnabled: boolean;
+  pnoteKeepDays: number;
+  pnoteFfmpegPath: string;
+}
+
+export interface PnoteStatus {
+  running: boolean;
+  connected: boolean;
+  battery: number | null;
+  charging: boolean;
+  capacity: [number, number] | null;
+  version: string | null;
+  sleeping: boolean;
+  pending: number;
 }
 
 export interface EntryRow {

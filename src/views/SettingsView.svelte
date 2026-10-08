@@ -25,6 +25,9 @@
     meetingPromptTemplate: "",
     meetingDeepPromptTemplate: "",
     clipboardEnabled: true,
+    pnoteEnabled: false,
+    pnoteKeepDays: 30,
+    pnoteFfmpegPath: "",
   };
   let saving = false;
   let asrStatus: AsrModelStatus | null = null;
@@ -36,6 +39,7 @@
     { id: "ai", label: "AI 服务" },
     { id: "summary", label: "汇总" },
     { id: "meeting", label: "会议录音" },
+    { id: "pnote", label: "录音卡" },
     { id: "general", label: "通用" },
   ] as const;
   let section: (typeof sections)[number]["id"] = "ai";
@@ -77,6 +81,15 @@
     } finally {
       downloadingModel = false;
       downloadText = "";
+    }
+  }
+
+  async function togglePnote(enabled: boolean) {
+    try {
+      await api.pnoteSetEnabled(enabled);
+      showToast(enabled ? "录音卡同步已启用" : "录音卡同步已停用");
+    } catch (e) {
+      showToast("录音卡设置失败：" + String(e));
     }
   }
 
@@ -226,6 +239,33 @@
           {/if}
         {/if}
         <span class="hint">包含语音识别（SenseVoice）、端点检测（FSMN-VAD）与说话人分离（CAM++）模型。</span>
+      </div>
+    {:else if section === "pnote"}
+      <div class="field">
+        <label>开关</label>
+        <div class="field-row">
+          <label style="display:flex;gap:6px;align-items:center;">
+            <input
+              type="checkbox"
+              bind:checked={form.pnoteEnabled}
+              on:change={() => togglePnote(form.pnoteEnabled)}
+            />
+            启用录音卡同步
+          </label>
+        </div>
+        <span class="hint">启用后立即生效，常驻蓝牙连接；录音保存后自动下载、转写并入库（来源：录音卡）。</span>
+      </div>
+
+      <div class="field">
+        <label>本地归档保留天数</label>
+        <input type="number" min="1" bind:value={form.pnoteKeepDays} style="width:140px;" />
+        <span class="hint">超过天数的 OGG 归档自动删除，已转写入库的条目不受影响。</span>
+      </div>
+
+      <div class="field">
+        <label>ffmpeg 路径</label>
+        <input type="text" bind:value={form.pnoteFfmpegPath} placeholder="留空则不校验时长" />
+        <span class="hint">留空则不校验时长；录音卡同步需要 Windows 蓝牙。</span>
       </div>
     {:else}
       <div class="field">
