@@ -33,19 +33,9 @@ pub struct PnoteStatus {
     pub capacity: Option<[i64; 2]>,
     pub version: Option<String>,
     pub sleeping: bool,
+    // sidecar 的 status 响应只有设备字段、不含 pending（本地待转写计数由 pnote_status 补）
+    #[serde(default)]
     pub pending: i64,
-}
-
-/// sidecar state 事件的 data 字段（字段可选，逐个合并进最新快照）。
-#[derive(Deserialize)]
-struct StateEvent {
-    running: Option<bool>,
-    connected: Option<bool>,
-    battery: Option<i64>,
-    charging: Option<bool>,
-    capacity: Option<[i64; 2]>,
-    version: Option<String>,
-    sleeping: Option<bool>,
 }
 
 /// 录音卡组件（PyInstaller 冻结的 pnote-sidecar）路径。
@@ -485,36 +475,80 @@ async fn transcribe_recorder_file(
 }
 
 /// 把 state 事件的 data 逐个字段合并进快照；battery==110 表示充电中。
+/// 逐字段容错：单个字段类型不对只跳过该字段并记 warn（附原始数据），其余字段照常合并；
+/// Option 字段收到 null 表示清除（sidecar 断连时推 battery/capacity/version=None）。
 fn merge_state_event(latest: &mut PnoteStatus, data: &serde_json::Value) {
-    let ev: StateEvent = match serde_json::from_value(data.clone()) {
-        Ok(e) => e,
-        Err(_) => return,
+    let obj = match data.as_object() {
+        Some(o) => o,
+        None => {
+            log::warn!("录音卡 state 事件 data 不是对象，已忽略: {data}");
+            return;
+        }
     };
-    if let Some(r) = ev.running {
-        latest.running = r;
-    }
-    if let Some(c) = ev.connected {
-        latest.connected = c;
-    }
-    if let Some(b) = ev.battery {
-        if b >= 110 {
-            latest.charging = true;
-            latest.battery = Some(100);
-        } else {
-            latest.battery = Some(b);
+    let mut bad: Vec<&str> = Vec::new();
+    for (key, value) in [
+        ("running", &mut latest.running),
+        ("connected", &mut latest.connected),
+        ("sleeping", &mut latest.sleeping),
+    ] {
+        match obj.get(key) {
+            Some(v) => match v.as_bool() {
+                Some(b) => *value = b,
+                None => bad.push(key),
+            },
+            None => {}
         }
     }
-    if let Some(c) = ev.charging {
-        latest.charging = c;
+    match obj.get("battery") {
+        Some(v) if v.is_null() => latest.battery = None,
+        Some(v) => match v.as_i64() {
+            Some(b) if b >= 110 => {
+                latest.charging = true;
+                latest.battery = Some(100);
+            }
+            Some(b) => latest.battery = Some(b),
+            None => bad.push("battery"),
+        },
+        None => {}
     }
-    if let Some(c) = ev.capacity {
-        latest.capacity = Some(c);
+    // 事件里显式的 charging 最后应用，可覆盖 battery>=110 的推断
+    match obj.get("charging") {
+        Some(v) => match v.as_bool() {
+            Some(b) => latest.charging = b,
+            None => bad.push("charging"),
+        },
+        None => {}
     }
-    if let Some(ver) = ev.version {
-        latest.version = Some(ver);
+    match obj.get("capacity") {
+        Some(v) if v.is_null() => latest.capacity = None,
+        Some(v) => {
+            let pair = v.as_array().and_then(|a| match a.as_slice() {
+                [x, y] => match (x.as_i64(), y.as_i64()) {
+                    (Some(x), Some(y)) => Some([x, y]),
+                    _ => None,
+                },
+                _ => None,
+            });
+            match pair {
+                Some(c) => latest.capacity = Some(c),
+                None => bad.push("capacity"),
+            }
+        }
+        None => {}
     }
-    if let Some(s) = ev.sleeping {
-        latest.sleeping = s;
+    match obj.get("version") {
+        Some(v) if v.is_null() => latest.version = None,
+        Some(v) => match v.as_str() {
+            Some(s) => latest.version = Some(s.to_string()),
+            None => bad.push("version"),
+        },
+        None => {}
+    }
+    if !bad.is_empty() {
+        log::warn!(
+            "录音卡 state 事件字段格式异常（已跳过 {}）: {data}",
+            bad.join(", ")
+        );
     }
 }
 
@@ -700,4 +734,152 @@ async fn stop_and_kill(app: &AppHandle) {
         latest.sleeping = false;
     }
     let _ = app.emit("pnote-state", PnoteStatus::default());
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 连接成功后 sidecar 实推的 state 事件形状（_refresh_device_info 全量 7 字段）
+    #[test]
+    fn merge_state_event_merges_real_shape() {
+        let mut latest = PnoteStatus::default();
+        let data = serde_json::json!({
+            "running": true,
+            "connected": true,
+            "sleeping": false,
+            "battery": 74,
+            "charging": false,
+            "capacity": [30498848, 30525408],
+            "version": "V1.0.0",
+        });
+        merge_state_event(&mut latest, &data);
+        assert!(latest.running);
+        assert!(latest.connected, "connected=true 必须合并进去");
+        assert!(!latest.sleeping);
+        assert_eq!(latest.battery, Some(74));
+        assert!(!latest.charging);
+        assert_eq!(latest.capacity, Some([30498848, 30525408]));
+        assert_eq!(latest.version.as_deref(), Some("V1.0.0"));
+    }
+
+    /// 单个字段畸形（capacity 长度不对、battery 是字符串）不影响其余字段合并
+    #[test]
+    fn merge_state_event_tolerates_bad_fields() {
+        let mut latest = PnoteStatus::default();
+        let data = serde_json::json!({
+            "running": true,
+            "connected": true,
+            "sleeping": false,
+            "battery": "74",
+            "charging": false,
+            "capacity": [30498848, 30525408, 3],
+            "version": "V1.0.0",
+        });
+        merge_state_event(&mut latest, &data);
+        assert!(latest.connected, "connected 仍应正确合并");
+        assert!(latest.running);
+        assert_eq!(latest.battery, None, "畸形 battery 应跳过");
+        assert_eq!(latest.capacity, None, "长度!=2 的 capacity 应跳过");
+        assert_eq!(latest.version.as_deref(), Some("V1.0.0"));
+    }
+
+    /// battery==110 表示充电中：置 charging 并展示 100%
+    #[test]
+    fn merge_state_event_battery_110_means_charging() {
+        let mut latest = PnoteStatus::default();
+        merge_state_event(&mut latest, &serde_json::json!({"battery": 110}));
+        assert_eq!(latest.battery, Some(100));
+        assert!(latest.charging);
+    }
+
+    /// 同一事件里显式 charging 最后应用，覆盖 battery>=110 的推断（沿用旧顺序）
+    #[test]
+    fn merge_state_event_explicit_charging_overrides_battery_inference() {
+        let mut latest = PnoteStatus::default();
+        merge_state_event(
+            &mut latest,
+            &serde_json::json!({"battery": 110, "charging": false}),
+        );
+        assert_eq!(latest.battery, Some(100));
+        assert!(!latest.charging);
+    }
+
+    /// 断连时 sidecar 推 battery/capacity/version=null：清除旧值，其余字段照常
+    #[test]
+    fn merge_state_event_null_clears_option_fields() {
+        let mut latest = PnoteStatus {
+            connected: true,
+            battery: Some(74),
+            capacity: Some([30498848, 30525408]),
+            version: Some("V1.0.0".into()),
+            ..Default::default()
+        };
+        merge_state_event(
+            &mut latest,
+            &serde_json::json!({
+                "connected": false, "battery": null, "capacity": null, "version": null,
+            }),
+        );
+        assert!(!latest.connected);
+        assert_eq!(latest.battery, None);
+        assert_eq!(latest.capacity, None);
+        assert_eq!(latest.version, None);
+    }
+
+    /// data 不是对象时不 panic、不改状态
+    #[test]
+    fn merge_state_event_ignores_non_object_data() {
+        let mut latest = PnoteStatus {
+            connected: true,
+            ..Default::default()
+        };
+        merge_state_event(&mut latest, &serde_json::json!("connected"));
+        assert!(latest.connected);
+    }
+
+    /// sidecar status 响应不含 pending 字段（pending 是本地计数），必须能反序列化——
+    /// 这是面板拿不到已连接快照的根因之一：pnote_status 命令此前因此 100% 失败
+    #[test]
+    fn pnote_status_response_deserializes_without_pending() {
+        let data = serde_json::json!({
+            "running": true,
+            "connected": true,
+            "battery": 74,
+            "charging": false,
+            "capacity": [30498848, 30525408],
+            "version": "V1.0.0",
+            "sleeping": false,
+        });
+        let s: PnoteStatus = serde_json::from_value(data).unwrap();
+        assert!(s.connected);
+        assert_eq!(s.battery, Some(74));
+        assert_eq!(s.capacity, Some([30498848, 30525408]));
+        assert_eq!(s.pending, 0, "pending 缺省应为 0");
+    }
+
+    /// 发给前端的快照字段名与 types.ts PnoteStatus 逐字段一致（camelCase）
+    #[test]
+    fn pnote_status_serializes_frontend_fields() {
+        let v = serde_json::to_value(PnoteStatus {
+            pending: 3,
+            ..Default::default()
+        })
+        .unwrap();
+        let obj = v.as_object().unwrap();
+        for key in [
+            "running",
+            "connected",
+            "battery",
+            "charging",
+            "capacity",
+            "version",
+            "sleeping",
+            "pending",
+        ] {
+            assert!(obj.contains_key(key), "快照缺少字段 {key}");
+        }
+        assert_eq!(obj.len(), 8, "快照字段数应与 types.ts PnoteStatus 一致");
+    }
 }
