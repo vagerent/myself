@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """马赛福录音卡守护 sidecar。
 
-常驻进程：BLE 长连接挂住录音卡，轮询文件列表并增量下载（OGG 封装 + ffmpeg 时长校验）。
+常驻进程：BLE 长连接挂住录音卡，轮询文件列表并增量下载（OGG 封装 + ffmpeg 时长校验；
+校验异常降级为非致命直接保存，下载失败退避 3 轮防死循环重下）。
 守护主循环移植自 录音卡/pnote_sync/daemon.py，退出由 stop_event 驱动（替代 KeyboardInterrupt）。
 
 控制通道（JSON-lines，stdout 只出协议行，日志全走 stderr）：
@@ -74,6 +75,7 @@ class Daemon:
         self.task: asyncio.Task | None = None
         self._conn_lock = asyncio.Lock()
         self._libs: _Libs | None = None
+        self._fail_cooldown: dict[str, int] = {}  # 文件名 -> 剩余退避轮数（下载失败后置 3）
         self._no_bleak = False  # 无 bleak 环境（调试机）：守护循环以纯休眠模式运行
         self.state = {
             "running": False,
@@ -202,18 +204,30 @@ class Daemon:
 
         data, _used = await pen.download(entry, preferred=".opus", on_progress=on_progress)
         content = libs.wrap_opus_blocks(data) if self.have_ffmpeg else data
-        if self.have_ffmpeg and not libs.verify_ogg(content, entry.time, self.ffmpeg):
-            raise ValueError(f"解码校验失败：时长与列表值 {entry.time}s 不符，未保存")
+        verify_state = "raw"  # verified=时长一致 / skipped=校验异常跳过 / mismatch=时长不符 / raw=未校验
+        if self.have_ffmpeg:
+            try:
+                verify_state = "verified" if libs.verify_ogg(content, entry.time, self.ffmpeg) else "mismatch"
+            except Exception as e:  # noqa: BLE001 - 校验超时/失败不阻塞保存，转写环节兜底
+                log(f"⚠ 时长校验失败/超时（{type(e).__name__}: {e}），跳过校验直接保存（转写环节会兜底验证内容）")
+                verify_state = "skipped"
+            if verify_state == "mismatch":
+                raise ValueError(f"解码校验失败：时长与列表值 {entry.time}s 不符，未保存")
         tmp = out_path.with_name(out_path.name + ".part")  # 先写 .part 再 rename，防半截文件
         tmp.write_bytes(content)
         tmp.rename(out_path)
-        kind = "OGG/Opus，已校验" if self.have_ffmpeg else "裸 Opus"
+        kind = {"verified": "OGG/Opus，已校验", "skipped": "OGG/Opus，时长校验跳过", "raw": "裸 Opus"}[verify_state]
         log(f"✓ 已保存 {out_path.name}（{len(data) / 1024:.0f} KB，{kind}）")
         return out_path
 
     # ---- 同步迭代（daemon.py 每 POLL 秒一轮的主体）----
 
     async def _sync_iteration(self, pen) -> int:
+        # 下载失败退避：每轮轮询把所有 cooldown -1，<=0 的剔除
+        for n in [n for n, c in self._fail_cooldown.items() if c <= 1]:
+            del self._fail_cooldown[n]
+        for n in self._fail_cooldown:
+            self._fail_cooldown[n] -= 1
         # 查录音状态，识别正在录制的文件（边录边下拿到的是半成品快照，时长校验会拒绝）
         rec_name = None
         try:
@@ -228,11 +242,18 @@ class Daemon:
             ext = ".ogg" if self.have_ffmpeg else ".opus"
             if (self.out_dir / f"{e.base}{ext}").exists():
                 continue
+            if self._fail_cooldown.get(e.name, 0) > 0:
+                log(f"⏳ {e.name} 上次下载失败，退避中（剩 {self._fail_cooldown[e.name]} 轮），本轮跳过")
+                continue
             if rec_name and e.base in rec_name:
                 log(f"⏸ {e.name} 正在录制中，本轮跳过（保存后下轮再收）")
                 continue
             log(f"🎙 发现新录音 {e.name}（{e.size / 1024:.0f} KB，约 {e.time} 秒）")
-            ogg_path = await self._download_one(pen, e)
+            try:
+                ogg_path = await self._download_one(pen, e)
+            except Exception:
+                self._fail_cooldown[e.name] = 3  # 失败退避 3 轮，防任何原因的失败立刻全量重下
+                raise
             new_count += 1
             # OGG 已校验落盘（.part→rename 完成）才发 file_synced
             emit("file_synced", {
