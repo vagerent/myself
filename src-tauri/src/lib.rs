@@ -3,6 +3,7 @@ mod db;
 mod hotkey;
 mod meeting;
 mod openai;
+mod pnote;
 mod settings;
 mod tasks;
 mod tray;
@@ -12,10 +13,12 @@ mod winstate;
 use chrono::{DateTime, Local};
 use db::Db;
 use settings::Settings;
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Mutex};
 use tauri::Manager;
+use tokio::sync::oneshot;
 
 pub struct AppState {
     pub db: Db,
@@ -34,6 +37,23 @@ pub struct AppState {
     pub tts_cancel: AtomicBool,
     /// 当前朗读任务的 sidecar 子进程句柄，供停止命令 kill
     pub tts_child: Mutex<Option<tokio::process::Child>>,
+    /// 录音卡常驻 sidecar 子进程句柄 / 控制通道写端（tokio Mutex：写 stdin 需跨 await 持有）
+    pub pnote_child: Mutex<Option<tokio::process::Child>>,
+    pub pnote_stdin: tokio::sync::Mutex<Option<tokio::process::ChildStdin>>,
+    /// 录音卡请求序号（JSON-lines 协议按 id 关联响应）
+    pub pnote_req_seq: AtomicU64,
+    /// 最近一次 state 事件快照
+    pub pnote_latest: Mutex<pnote::PnoteStatus>,
+    /// 挂起的录音卡请求：id → oneshot 发送端
+    pub pnote_pending: Mutex<HashMap<u64, oneshot::Sender<serde_json::Value>>>,
+    /// 本次 spawn 的 ready 信号（stdout 出现 ready 事件时触发）
+    pub pnote_ready: Mutex<Option<oneshot::Sender<()>>>,
+    /// 同步/转写重入守卫
+    pub pnote_busy: AtomicBool,
+    /// spawn 串行锁，防并发 command 拉起两个实例
+    pub pnote_spawn_lock: tokio::sync::Mutex<()>,
+    /// sidecar 代次：重新 spawn 时 +1，旧监控任务看到代次不符即退场
+    pub pnote_gen: AtomicU64,
 }
 
 pub fn run() {
@@ -97,10 +117,29 @@ pub fn run() {
                 tts_speaking: AtomicBool::new(false),
                 tts_cancel: AtomicBool::new(false),
                 tts_child: Mutex::new(None),
+                pnote_child: Mutex::new(None),
+                pnote_stdin: tokio::sync::Mutex::new(None),
+                pnote_req_seq: AtomicU64::new(0),
+                pnote_latest: Mutex::new(pnote::PnoteStatus::default()),
+                pnote_pending: Mutex::new(HashMap::new()),
+                pnote_ready: Mutex::new(None),
+                pnote_busy: AtomicBool::new(false),
+                pnote_spawn_lock: tokio::sync::Mutex::new(()),
+                pnote_gen: AtomicU64::new(0),
             });
 
             if let Err(e) = hotkey::apply_hotkey(app_handle, &settings.hotkey) {
                 log::warn!("全局快捷键注册失败（不影响使用）: {e}");
+            }
+            // 录音卡常驻 sidecar：fire-and-forget，不阻塞启动；失败仅记日志，
+            // 下次 pnote_status 等命令调用时会经 ensure_sidecar 重试
+            if settings.pnote_enabled {
+                let app2 = app_handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(e) = pnote::ensure_sidecar(&app2).await {
+                        log::warn!("录音卡组件启动失败（可在设置中重新启用）: {e}");
+                    }
+                });
             }
             tray::build_tray(app_handle)?;
             tasks::spawn_background(app_handle.clone());
@@ -144,7 +183,11 @@ pub fn run() {
             tts::download_tts_model,
             tts::meeting_speak,
             tts::meeting_stop_speak,
-            tts::tts_read_wav
+            tts::tts_read_wav,
+            pnote::pnote_status,
+            pnote::pnote_sync_now,
+            pnote::pnote_file_list,
+            pnote::pnote_set_enabled
         ])
         .run(tauri::generate_context!())
         .expect("运行马赛福失败");

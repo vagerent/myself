@@ -1,0 +1,484 @@
+//! 录音卡常驻 sidecar 管理：进程生命周期、JSON-lines 请求/事件协议、控制命令。
+//!
+//! sidecar（pnote-sidecar/pnote.exe，PyInstaller 冻结）通过 stdin 收请求、stdout 推
+//! 响应与事件、stderr 打 `MASAIFU_LOG` 诊断日志。协议见
+//! docs/plans/2026-10-08-recorder-implementation.md「协议定义」。
+
+use crate::db;
+use crate::AppState;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+use tauri::{AppHandle, Emitter, Manager};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::oneshot;
+
+const READY_TIMEOUT: Duration = Duration::from_secs(10);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+// 全量同步下载 12MB 约 11 分钟，给 20 分钟余量
+const SYNC_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+
+/// 录音卡设备状态快照；字段与前端 types.ts 的 PnoteStatus 一致（camelCase）。
+/// 注意：协议里 battery==110 表示充电中（展示为 100% + 充电标记）。
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PnoteStatus {
+    pub running: bool,
+    pub connected: bool,
+    pub battery: Option<i64>,
+    pub charging: bool,
+    pub capacity: Option<[i64; 2]>,
+    pub version: Option<String>,
+    pub sleeping: bool,
+    pub pending: i64,
+}
+
+/// sidecar state 事件的 data 字段（字段可选，逐个合并进最新快照）。
+#[derive(Deserialize)]
+struct StateEvent {
+    running: Option<bool>,
+    connected: Option<bool>,
+    battery: Option<i64>,
+    charging: Option<bool>,
+    capacity: Option<[i64; 2]>,
+    version: Option<String>,
+    sleeping: Option<bool>,
+}
+
+/// 录音卡组件（PyInstaller 冻结的 pnote-sidecar）路径。
+/// 打包后位于资源目录，开发时位于 src-tauri/resources/ 下。
+fn pnote_sidecar_exe(app: &AppHandle) -> Result<PathBuf, String> {
+    let name = if cfg!(windows) { "pnote.exe" } else { "pnote" };
+    if let Ok(dir) = app.path().resource_dir() {
+        let p = dir.join("pnote-sidecar").join(name);
+        if p.is_file() {
+            return Ok(p);
+        }
+    }
+    let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("resources")
+        .join("pnote-sidecar")
+        .join(name);
+    if dev.is_file() {
+        return Ok(dev);
+    }
+    Err("录音卡组件未构建，见 tools/build_sidecar.md".into())
+}
+
+/// 设备状态查询（合并本地待转写计数）。
+#[tauri::command]
+pub async fn pnote_status(app: AppHandle) -> Result<PnoteStatus, String> {
+    let enabled = {
+        let state = app.state::<AppState>();
+        let settings = state.settings.lock().map_err(|e| e.to_string())?;
+        settings.pnote_enabled
+    };
+    if !enabled {
+        // 未启用时不拉起 sidecar，直接回默认状态
+        return Ok(PnoteStatus::default());
+    }
+    let mut status: PnoteStatus =
+        pnote_request(&app, "status", serde_json::json!({}), REQUEST_TIMEOUT).await?;
+    let pending = {
+        let state = app.state::<AppState>();
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        db::recorder_pending_count(&conn).map_err(|e| e.to_string())?
+    };
+    status.pending = pending;
+    // 回写快照，让后续 pnote-state 事件带上较新的 pending
+    if let Ok(mut latest) = app.state::<AppState>().pnote_latest.lock() {
+        *latest = status.clone();
+    }
+    Ok(status)
+}
+
+/// 立即跑一轮同步。响应可能很慢（下载 12MB 约 11 分钟），超时给 20 分钟。
+#[tauri::command]
+pub async fn pnote_sync_now(app: AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    if state.pnote_busy.swap(true, Ordering::SeqCst) {
+        return Err("已有录音卡同步任务进行中".into());
+    }
+    let result: Result<serde_json::Value, String> =
+        pnote_request(&app, "sync_now", serde_json::json!({}), SYNC_TIMEOUT).await;
+    state.pnote_busy.store(false, Ordering::SeqCst);
+    result.map(|_| ())
+}
+
+/// 设备端文件列表。
+#[tauri::command]
+pub async fn pnote_file_list(app: AppHandle) -> Result<serde_json::Value, String> {
+    pnote_request(&app, "file_list", serde_json::json!({}), REQUEST_TIMEOUT).await
+}
+
+/// 启用/停用录音卡同步。启用即拉起 sidecar 并启动守护循环；停用发 stop 后 kill。
+/// 照 commands.rs save_settings 的写法：锁 settings、改字段、调 .save。
+#[tauri::command]
+pub async fn pnote_set_enabled(app: AppHandle, enabled: bool) -> Result<(), String> {
+    {
+        let state = app.state::<AppState>();
+        let path = state.settings_path.clone();
+        let mut settings = state.settings.lock().map_err(|e| e.to_string())?;
+        settings.pnote_enabled = enabled;
+        let saved = settings.save(&path);
+        saved?;
+    }
+    if enabled {
+        ensure_sidecar(&app).await?;
+        pnote_request::<serde_json::Value>(&app, "start", serde_json::json!({}), REQUEST_TIMEOUT)
+            .await?;
+    } else {
+        stop_and_kill(&app).await;
+    }
+    Ok(())
+}
+
+/// sidecar 不存在或已退出时重新 spawn；本次新起的实例等 ready 事件（10s 超时）。
+pub async fn ensure_sidecar(app: &AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    // 串行化 spawn，防并发 command 拉起两个实例
+    let _spawn_guard = state.pnote_spawn_lock.lock().await;
+
+    let needs_spawn = {
+        let mut guard = state.pnote_child.lock().map_err(|e| e.to_string())?;
+        match guard.as_mut() {
+            Some(c) => matches!(c.try_wait(), Ok(Some(_)) | Err(_)),
+            None => true,
+        }
+    };
+    if needs_spawn {
+        let ready_rx = spawn_inner(app).await?;
+        tokio::time::timeout(READY_TIMEOUT, ready_rx)
+            .await
+            .map_err(|_| "录音卡组件启动超时".to_string())?
+            .map_err(|_| "录音卡组件启动中断".to_string())?;
+    }
+    Ok(())
+}
+
+/// 启动 sidecar 并登记句柄；返回 ready 信号的接收端（本实例 stdout 出现
+/// `{"type":"event","event":"ready",...}` 时触发）。崩溃后由下一次 ensure_sidecar 重新拉起。
+async fn spawn_inner(app: &AppHandle) -> Result<oneshot::Receiver<()>, String> {
+    let exe = pnote_sidecar_exe(app)?;
+    let out_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("recorder-audio");
+    std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
+    let ffmpeg = {
+        let state = app.state::<AppState>();
+        let settings = state.settings.lock().map_err(|e| e.to_string())?;
+        settings.pnote_ffmpeg_path.clone()
+    };
+
+    let mut cmd = tokio::process::Command::new(&exe);
+    cmd.arg("--out-dir")
+        .arg(&out_dir)
+        .arg("--ffmpeg")
+        .arg(&ffmpeg)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    // Windows 下 GUI 程序拉起控制台子进程会闪出一个黑窗口，CREATE_NO_WINDOW 抑制
+    #[cfg(windows)]
+    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("录音卡组件启动失败: {e}"))?;
+
+    let stdin = child.stdin.take().ok_or("无法写入录音卡组件 stdin")?;
+    let stdout = child.stdout.take().ok_or("无法读取录音卡组件 stdout")?;
+    let stderr = child.stderr.take().ok_or("无法读取录音卡组件 stderr")?;
+
+    let state = app.state::<AppState>();
+    // 代次 +1：旧监控任务（含残留子进程句柄、挂起请求）看到代次不符即退出
+    let gen = state.pnote_gen.fetch_add(1, Ordering::SeqCst) + 1;
+
+    // 回收上一个实例的残留：清挂起请求（发不出去响应了），句柄稍后覆盖
+    if let Ok(mut pending) = state.pnote_pending.lock() {
+        pending.clear();
+    }
+
+    let (ready_tx, ready_rx) = oneshot::channel::<()>();
+    {
+        let mut old = None;
+        {
+            let mut guard = state.pnote_child.lock().map_err(|e| e.to_string())?;
+            std::mem::swap(&mut old, &mut *guard);
+            *guard = Some(child);
+        }
+        *state.pnote_stdin.lock().await = Some(stdin);
+        *state.pnote_ready.lock().map_err(|e| e.to_string())? = Some(ready_tx);
+        // 上一个实例若有残留句柄（已被取代但还没被监控回收），后台 reap
+        if let Some(mut old_child) = old {
+            tokio::spawn(async move {
+                let _ = old_child.wait().await;
+            });
+        }
+    }
+
+    let app_out = app.clone();
+    tokio::spawn(async move {
+        read_stdout_loop(app_out, stdout).await;
+    });
+    tokio::spawn(async move {
+        read_stderr_loop(stderr).await;
+    });
+
+    // 崩溃监控：轮询子进程状态，退出时清句柄 + 通知前端断开；下次 ensure 重新拉起
+    let app_mon = app.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let state = app_mon.state::<AppState>();
+            if state.pnote_gen.load(Ordering::SeqCst) != gen {
+                return; // 已被新实例取代（或被手动重启），本任务退场
+            }
+            let mut exited = None;
+            {
+                if let Ok(mut guard) = state.pnote_child.lock() {
+                    if let Some(c) = guard.as_mut() {
+                        if matches!(c.try_wait(), Ok(Some(_)) | Err(_)) {
+                            exited = guard.take();
+                        }
+                    }
+                }
+            } // std MutexGuard 不能跨 await，回收 wait 前先 drop
+            if let Some(mut child) = exited {
+                let _ = child.wait().await;
+                if state.pnote_gen.load(Ordering::SeqCst) != gen {
+                    return;
+                }
+                *state.pnote_stdin.lock().await = None;
+                let snapshot = {
+                    if let Ok(mut latest) = state.pnote_latest.lock() {
+                        latest.running = false;
+                        latest.connected = false;
+                        latest.sleeping = false;
+                        latest.clone()
+                    } else {
+                        PnoteStatus::default()
+                    }
+                };
+                log::warn!("录音卡组件已退出（崩溃或被终止），下次调用将自动重启");
+                let _ = app_mon.emit("pnote-state", snapshot);
+                return;
+            }
+        }
+    });
+
+    Ok(ready_rx)
+}
+
+/// stdout 逐行读 JSON：resp 按 id 分发给挂起的 oneshot；event 更新快照并发前端。
+async fn read_stdout_loop(app: AppHandle, stdout: tokio::process::ChildStdout) {
+    let mut lines = BufReader::new(stdout).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        let v: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        match v.get("type").and_then(|t| t.as_str()) {
+            Some("resp") => {
+                let id = v.get("id").and_then(|i| i.as_u64()).unwrap_or(0);
+                let state = app.state::<AppState>();
+                let tx = state
+                    .pnote_pending
+                    .lock()
+                    .ok()
+                    .and_then(|mut m| m.remove(&id));
+                if let Some(tx) = tx {
+                    let _ = tx.send(v); // 接收端已超时丢弃则忽略
+                }
+            }
+            Some("event") => handle_event(&app, v).await,
+            _ => {}
+        }
+    }
+}
+
+async fn handle_event(app: &AppHandle, v: serde_json::Value) {
+    let event = v.get("event").and_then(|e| e.as_str()).unwrap_or("");
+    let data = v.get("data").cloned().unwrap_or(serde_json::Value::Null);
+    match event {
+        "ready" => {
+            let state = app.state::<AppState>();
+            let tx = {
+                let mut g = match state.pnote_ready.lock() {
+                    Ok(g) => g,
+                    Err(_) => return,
+                };
+                g.take()
+            };
+            if let Some(tx) = tx {
+                let _ = tx.send(());
+            }
+        }
+        "state" => {
+            let state = app.state::<AppState>();
+            let snapshot = {
+                let mut latest = match state.pnote_latest.lock() {
+                    Ok(g) => g,
+                    Err(_) => return,
+                };
+                merge_state_event(&mut latest, &data);
+                latest.clone()
+            };
+            let _ = app.emit("pnote-state", snapshot);
+        }
+        // file_synced 的入库/转写编排（Task 6）；这里先把事件透传给前端
+        "file_synced" => {
+            let _ = app.emit("pnote-synced", data);
+        }
+        "progress" => {
+            let _ = app.emit("pnote-progress", data);
+        }
+        _ => {}
+    }
+}
+
+/// 把 state 事件的 data 逐个字段合并进快照；battery==110 表示充电中。
+fn merge_state_event(latest: &mut PnoteStatus, data: &serde_json::Value) {
+    let ev: StateEvent = match serde_json::from_value(data.clone()) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    if let Some(r) = ev.running {
+        latest.running = r;
+    }
+    if let Some(c) = ev.connected {
+        latest.connected = c;
+    }
+    if let Some(b) = ev.battery {
+        if b >= 110 {
+            latest.charging = true;
+            latest.battery = Some(100);
+        } else {
+            latest.battery = Some(b);
+        }
+    }
+    if let Some(c) = ev.charging {
+        latest.charging = c;
+    }
+    if let Some(c) = ev.capacity {
+        latest.capacity = Some(c);
+    }
+    if let Some(ver) = ev.version {
+        latest.version = Some(ver);
+    }
+    if let Some(s) = ev.sleeping {
+        latest.sleeping = s;
+    }
+}
+
+/// stderr 排空：协议行进日志，其余行保留尾部 6 行做崩溃诊断。
+async fn read_stderr_loop(stderr: tokio::process::ChildStderr) {
+    let mut lines = BufReader::new(stderr).lines();
+    let mut tail: Vec<String> = Vec::new();
+    while let Ok(Some(line)) = lines.next_line().await {
+        if let Some(msg) = line.strip_prefix("MASAIFU_LOG ") {
+            log::info!("[pnote] {msg}");
+        } else if !line.starts_with("MASAIFU_") && !line.trim().is_empty() {
+            tail.push(line);
+            if tail.len() > 6 {
+                tail.remove(0);
+            }
+        }
+    }
+    if !tail.is_empty() {
+        log::warn!("录音卡组件 stderr 尾部: {}", tail.join(" | "));
+    }
+}
+
+/// 发一个 JSON-lines 请求并等响应；extra 为除 id/cmd 外的字段（须为对象）。
+async fn pnote_request<T: DeserializeOwned>(
+    app: &AppHandle,
+    cmd: &str,
+    extra: serde_json::Value,
+    timeout: Duration,
+) -> Result<T, String> {
+    ensure_sidecar(app).await?;
+    let state = app.state::<AppState>();
+    let id = state.pnote_req_seq.fetch_add(1, Ordering::SeqCst) + 1;
+
+    let (tx, rx) = oneshot::channel();
+    state
+        .pnote_pending
+        .lock()
+        .map_err(|e| e.to_string())?
+        .insert(id, tx);
+
+    let mut req = match extra {
+        serde_json::Value::Object(m) => m,
+        _ => serde_json::Map::new(),
+    };
+    req.insert("id".into(), serde_json::json!(id));
+    req.insert("cmd".into(), serde_json::json!(cmd));
+    let mut line = serde_json::Value::Object(req).to_string();
+    line.push('\n');
+    {
+        // tokio Mutex 守卫可跨 await 持有；写期间 sidecar 句柄不会被并发清掉
+        let mut guard = state.pnote_stdin.lock().await;
+        let stdin = guard
+            .as_mut()
+            .ok_or_else(|| "录音卡组件未运行".to_string())?;
+        stdin
+            .write_all(line.as_bytes())
+            .await
+            .map_err(|e| format!("录音卡组件写入失败: {e}"))?;
+        stdin.flush().await.map_err(|e| e.to_string())?;
+    }
+
+    let resp = tokio::time::timeout(timeout, rx)
+        .await
+        .map_err(|_| format!("录音卡组件响应超时（{cmd}）"))?
+        .map_err(|_| "录音卡组件连接中断".to_string())?;
+    if resp.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+        serde_json::from_value(resp.get("data").cloned().unwrap_or(serde_json::Value::Null))
+            .map_err(|e| format!("录音卡组件响应格式错误: {e}"))
+    } else {
+        Err(resp
+            .get("error")
+            .and_then(|e| e.as_str())
+            .unwrap_or("未知错误")
+            .to_string())
+    }
+}
+
+/// 发 stop 请求（尽力而为）并 kill 子进程；清空句柄由监控任务接力完成。
+async fn stop_and_kill(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let _spawn_guard = state.pnote_spawn_lock.lock().await;
+    {
+        let mut guard = state.pnote_stdin.lock().await;
+        if let Some(stdin) = guard.as_mut() {
+            let id = state.pnote_req_seq.fetch_add(1, Ordering::SeqCst) + 1;
+            let line = format!("{{\"id\":{id},\"cmd\":\"stop\"}}\n");
+            let _ = stdin.write_all(line.as_bytes()).await;
+            let _ = stdin.flush().await;
+        }
+    }
+    // 稍等优雅退出，超时就地 kill
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let taken = state
+        .pnote_child
+        .lock()
+        .ok()
+        .and_then(|mut guard| guard.take());
+    *state.pnote_stdin.lock().await = None;
+    if let Some(mut child) = taken {
+        let _ = child.start_kill();
+        tokio::spawn(async move {
+            let _ = child.wait().await;
+        });
+    }
+    if let Ok(mut latest) = state.pnote_latest.lock() {
+        latest.running = false;
+        latest.connected = false;
+        latest.sleeping = false;
+    }
+    let _ = app.emit("pnote-state", PnoteStatus::default());
+}
