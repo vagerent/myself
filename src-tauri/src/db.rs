@@ -86,6 +86,18 @@ pub struct UnprocessedRow {
     pub raw_content: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecorderFileRow {
+    pub name: String,
+    pub size: i64,
+    pub seconds: i64,
+    pub status: String,
+    pub ogg_path: Option<String>,
+    pub entry_id: Option<i64>,
+    pub created_at: String,
+}
+
 pub fn init(conn: &Connection) -> rusqlite::Result<()> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "busy_timeout", 5000)?;
@@ -143,6 +155,16 @@ pub fn init(conn: &Connection) -> rusqlite::Result<()> {
           created_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_reminders_next_fire ON reminders(enabled, next_fire_at);
+
+        CREATE TABLE IF NOT EXISTS recorder_files (
+          name TEXT PRIMARY KEY,
+          size INTEGER NOT NULL,
+          seconds INTEGER NOT NULL DEFAULT 0,
+          status TEXT NOT NULL DEFAULT 'listed',
+          ogg_path TEXT,
+          entry_id INTEGER,
+          created_at TEXT NOT NULL
+        );
         "#,
     )?;
     ensure_column(conn, "entries", "deep_analysis", "TEXT")?;
@@ -924,6 +946,16 @@ pub fn delete_reminder(conn: &Connection, id: i64) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// 删除条目及其全文索引（FTS 行由 doc_type='entry' + doc_id 定位，无外键级联）
+pub fn delete_entry(conn: &Connection, id: i64) -> rusqlite::Result<()> {
+    conn.execute(
+        "DELETE FROM entries_fts WHERE doc_type = 'entry' AND doc_id = ?1",
+        params![id.to_string()],
+    )?;
+    conn.execute("DELETE FROM entries WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
 pub fn set_reminder_enabled(conn: &Connection, id: i64, enabled: bool) -> rusqlite::Result<()> {
     conn.execute(
         "UPDATE reminders SET enabled = ?1 WHERE id = ?2",
@@ -995,6 +1027,104 @@ pub fn advance_reminder(conn: &Connection, id: i64, next_fire_at: &str) -> rusql
 pub fn mark_reminder_missed(conn: &Connection, id: i64) -> rusqlite::Result<()> {
     conn.execute("UPDATE reminders SET enabled = 0 WHERE id = ?1", params![id])?;
     Ok(())
+}
+
+// ---------- 录音卡同步 ----------
+
+const RECORDER_FILE_COLS: &str = "name, size, seconds, status, ogg_path, entry_id, created_at";
+
+fn row_to_recorder_file(r: &rusqlite::Row<'_>) -> rusqlite::Result<RecorderFileRow> {
+    Ok(RecorderFileRow {
+        name: r.get(0)?,
+        size: r.get(1)?,
+        seconds: r.get(2)?,
+        status: r.get(3)?,
+        ogg_path: r.get(4)?,
+        entry_id: r.get(5)?,
+        created_at: r.get(6)?,
+    })
+}
+
+/// 登记设备端文件；已存在（按 name 去重）则不覆盖，避免回退同步状态。
+pub fn recorder_file_upsert(
+    conn: &Connection,
+    name: &str,
+    size: i64,
+    seconds: i64,
+    status: &str,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO recorder_files (name, size, seconds, status, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(name) DO NOTHING",
+        params![name, size, seconds, status, now_str()],
+    )?;
+    Ok(())
+}
+
+/// 更新同步状态；entry_id / ogg_path 传 None 时保留原值（分阶段回填）。
+pub fn recorder_file_mark(
+    conn: &Connection,
+    name: &str,
+    status: &str,
+    entry_id: Option<i64>,
+    ogg_path: Option<&str>,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE recorder_files SET status = ?2,
+             entry_id = COALESCE(?3, entry_id),
+             ogg_path = COALESCE(?4, ogg_path)
+         WHERE name = ?1",
+        params![name, status, entry_id, ogg_path],
+    )?;
+    Ok(())
+}
+
+pub fn recorder_file_get(
+    conn: &Connection,
+    name: &str,
+) -> rusqlite::Result<Option<RecorderFileRow>> {
+    conn.query_row(
+        &format!("SELECT {RECORDER_FILE_COLS} FROM recorder_files WHERE name = ?1"),
+        params![name],
+        row_to_recorder_file,
+    )
+    .optional()
+}
+
+/// 设备 GC 候选：status='done' 且 ogg 文件 mtime 早于 days 天。
+/// mtime 判断在 Rust 侧做（SQL 只取 done 行）；ogg 文件已不存在的不列入。
+pub fn recorder_files_done_before(conn: &Connection, days: i64) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT name, ogg_path FROM recorder_files WHERE status = 'done'")?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let cutoff = std::time::SystemTime::now()
+        .checked_sub(std::time::Duration::from_secs(days.max(0) as u64 * 86400))
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    Ok(rows
+        .into_iter()
+        .filter(|(_, ogg)| {
+            ogg.as_deref()
+                .map(|p| {
+                    std::fs::metadata(p)
+                        .and_then(|m| m.modified())
+                        .map(|t| t < cutoff)
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false)
+        })
+        .map(|(name, _)| name)
+        .collect())
+}
+
+/// 未完成的同步计数（listed/downloading/failed），给前端徽标。
+pub fn recorder_pending_count(conn: &Connection) -> rusqlite::Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM recorder_files WHERE status IN ('listed','downloading','failed')",
+        [],
+        |r| r.get(0),
+    )
 }
 
 #[cfg(test)]
@@ -1131,6 +1261,23 @@ mod tests {
     }
 
     #[test]
+    fn delete_entry_removes_row_and_fts() {
+        let conn = Connection::open_in_memory().unwrap();
+        init(&conn).unwrap();
+        let id = insert_entry(&conn, "待删除的内容", "manual", true).unwrap().unwrap();
+        delete_entry(&conn, id).unwrap();
+        assert!(get_entry(&conn, id).unwrap().is_none());
+        let fts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entries_fts WHERE doc_type = 'entry' AND doc_id = ?1",
+                params![id.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fts, 0, "删除条目后其全文索引也应清除");
+    }
+
+    #[test]
     fn entries_range_query() {
         let conn = Connection::open_in_memory().unwrap();
         init(&conn).unwrap();
@@ -1160,5 +1307,71 @@ mod tests {
         assert!(!is_week_key("2026-W3"));
         assert_eq!(summary_title("2026-W33"), "每周汇总 2026-W33");
         assert_eq!(summary_title("2026-08-11"), "每日汇总 2026-08-11");
+    }
+
+    #[test]
+    fn recorder_file_status_roundtrip() {
+        let conn = Connection::open_in_memory().unwrap();
+        init(&conn).unwrap();
+        recorder_file_upsert(&conn, "note001.", 55000, 27, "downloading").unwrap();
+        recorder_file_mark(&conn, "note001.", "done", Some(42), Some("/a/b.ogg")).unwrap();
+        let f = recorder_file_get(&conn, "note001.").unwrap().unwrap();
+        assert_eq!(f.status, "done");
+        assert_eq!(f.entry_id, Some(42));
+        // 重复 upsert 不报错（去重键为 name）
+        recorder_file_upsert(&conn, "note001.", 55000, 27, "listed").unwrap();
+        assert_eq!(recorder_file_get(&conn, "note001.").unwrap().unwrap().status, "done",
+            "已存在的记录不能被回退成 listed");
+    }
+
+    #[test]
+    fn recorder_files_done_before_lists_only_old_ogg() {
+        use std::time::{Duration, SystemTime};
+        let conn = Connection::open_in_memory().unwrap();
+        init(&conn).unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "masaifu-done-before-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 旧文件：mtime 拨回 40 天前
+        let old_ogg = dir.join("old.ogg");
+        std::fs::write(&old_ogg, b"ogg").unwrap();
+        let f = std::fs::OpenOptions::new().write(true).open(&old_ogg).unwrap();
+        f.set_modified(SystemTime::now() - Duration::from_secs(40 * 86400))
+            .unwrap();
+        drop(f);
+        // 新文件：mtime 即现在
+        let new_ogg = dir.join("new.ogg");
+        std::fs::write(&new_ogg, b"ogg").unwrap();
+
+        recorder_file_upsert(&conn, "old.", 1, 1, "done").unwrap();
+        recorder_file_mark(&conn, "old.", "done", None, Some(old_ogg.to_str().unwrap())).unwrap();
+        recorder_file_upsert(&conn, "new.", 1, 1, "done").unwrap();
+        recorder_file_mark(&conn, "new.", "done", None, Some(new_ogg.to_str().unwrap())).unwrap();
+        // ogg 已被本地清理（文件不存在）：无法判断年龄，不应列入
+        recorder_file_upsert(&conn, "missing.", 1, 1, "done").unwrap();
+        recorder_file_mark(
+            &conn,
+            "missing.",
+            "done",
+            None,
+            Some(dir.join("gone.ogg").to_str().unwrap()),
+        )
+        .unwrap();
+        // 非 done 状态：即使文件很旧也不列入，但计入 pending
+        recorder_file_upsert(&conn, "failed.", 1, 1, "failed").unwrap();
+        recorder_file_mark(&conn, "failed.", "failed", None, Some(old_ogg.to_str().unwrap()))
+            .unwrap();
+        assert_eq!(recorder_pending_count(&conn).unwrap(), 1);
+
+        let names = recorder_files_done_before(&conn, 30).unwrap();
+        assert_eq!(names, vec!["old.".to_string()], "只有 ogg mtime 早于 30 天的 done 行才应列入");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
