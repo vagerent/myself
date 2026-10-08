@@ -410,6 +410,21 @@ pub fn entries_for_range(
     Ok(rows)
 }
 
+/// 最近 N 天内录音卡来源（source='recorder'）的条目，按时间升序。
+pub fn recorder_entries_since(conn: &Connection, days: i64) -> rusqlite::Result<Vec<EntryRow>> {
+    use chrono::{Duration, Local};
+    let since = (Local::now() - Duration::days(days))
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {ENTRY_COLS} FROM entries WHERE source = 'recorder' AND created_at >= ?1 ORDER BY created_at ASC"
+    ))?;
+    let rows = stmt
+        .query_map(params![since], row_to_entry)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 /// 范围内未预处理条目。
 pub fn unprocessed_for_range(
     conn: &Connection,
@@ -1211,6 +1226,44 @@ mod tests {
         .unwrap();
         let again = insert_entry(&conn, "同一段内容", "clipboard", false).unwrap();
         assert!(again.is_none(), "全量排重时，隔天同内容不应再入库");
+    }
+
+    #[test]
+    fn recorder_entries_since_filters_source_and_window() {
+        let conn = Connection::open_in_memory().unwrap();
+        init(&conn).unwrap();
+        let old = (Local::now() - chrono::Duration::days(10))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        conn.execute(
+            "INSERT INTO entries (raw_content, content_hash, source, created_at) VALUES (?1, ?2, 'recorder', ?3)",
+            params!["十天前的录音", sha256("十天前的录音"), old],
+        )
+        .unwrap();
+        let yesterday = (Local::now() - chrono::Duration::days(1))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        conn.execute(
+            "INSERT INTO entries (raw_content, content_hash, source, created_at) VALUES (?1, ?2, 'recorder', ?3)",
+            params!["昨天的录音", sha256("昨天的录音"), yesterday.clone()],
+        )
+        .unwrap();
+        // 窗口内的非录音卡来源不应命中
+        conn.execute(
+            "INSERT INTO entries (raw_content, content_hash, source, created_at) VALUES (?1, ?2, 'clipboard', ?3)",
+            params!["昨天的剪贴板", sha256("昨天的剪贴板"), yesterday],
+        )
+        .unwrap();
+        let rows = recorder_entries_since(&conn, 7).unwrap();
+        assert_eq!(rows.len(), 1, "只应命中窗口内的录音卡条目");
+        assert_eq!(rows[0].raw_content, "昨天的录音");
+        assert_eq!(rows[0].source, "recorder");
+        // 再补一条今天的录音，结果应保持时间升序
+        insert_entry(&conn, "今天的录音", "recorder", true).unwrap();
+        let rows = recorder_entries_since(&conn, 7).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].created_at <= rows[1].created_at);
+        assert_eq!(rows[1].raw_content, "今天的录音");
     }
 
     #[test]

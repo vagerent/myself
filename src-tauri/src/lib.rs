@@ -190,7 +190,8 @@ pub fn run() {
             pnote::pnote_status,
             pnote::pnote_sync_now,
             pnote::pnote_file_list,
-            pnote::pnote_set_enabled
+            pnote::pnote_set_enabled,
+            pnote::analyze_recorder_events
         ])
         .run(tauri::generate_context!())
         .expect("运行马赛福失败");

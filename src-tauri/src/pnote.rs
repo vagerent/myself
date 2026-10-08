@@ -6,6 +6,7 @@
 
 use crate::db;
 use crate::meeting;
+use crate::openai::OpenAiClient;
 use crate::AppState;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -128,6 +129,88 @@ pub async fn pnote_set_enabled(app: AppHandle, enabled: bool) -> Result<(), Stri
         stop_and_kill(&app).await;
     }
     Ok(())
+}
+
+/// 一键分析最近 7 天的录音转写，提取值得提醒的未来事件（承诺、待办、约定、
+/// deadline、账单、预约、要跟进的人和事）并创建为单次提醒（09:00 触发）。
+/// 返回创建的提醒条数；分析提示词在「设置 → 录音卡」中可修改。
+#[tauri::command]
+pub async fn analyze_recorder_events(app: AppHandle) -> Result<i64, String> {
+    let settings = {
+        let state = app.state::<AppState>();
+        let s = state.settings.lock().map_err(|e| e.to_string())?.clone();
+        s
+    };
+    if !settings.api_key_present() {
+        return Err("请先在「设置 → AI 服务」中配置 API Key".into());
+    }
+    let entries = with_db(&app, |conn| db::recorder_entries_since(conn, 7))?;
+    if entries.is_empty() {
+        return Err("最近 7 天没有录音记录".into());
+    }
+    let tomorrow = (chrono::Local::now() + chrono::Duration::days(1))
+        .format("%Y-%m-%d")
+        .to_string();
+    let user = entries
+        .iter()
+        .map(|e| {
+            let text = e
+                .clean_content
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(&e.raw_content);
+            format!("[录制于 {}]\n{text}", &e.created_at[..10])
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let client = OpenAiClient::new(&settings.base_url, &settings.api_key, &settings.model);
+    let raw = client
+        .recorder_events(&user, &settings.recorder_event_prompt)
+        .await
+        .map_err(|e| format!("AI 分析失败：{e}"))?;
+    // 模型可能在 JSON 前后输出多余文字：抠出第一个 '[' 到最后一个 ']' 的数组
+    let start = raw
+        .find('[')
+        .ok_or_else(|| "AI 返回内容中没有找到 JSON 数组".to_string())?;
+    let end = raw
+        .rfind(']')
+        .filter(|&i| i >= start)
+        .ok_or_else(|| "AI 返回内容中没有找到完整的 JSON 数组".to_string())?;
+    let value: serde_json::Value = serde_json::from_str(&raw[start..=end])
+        .map_err(|e| format!("AI 返回的 JSON 解析失败：{e}"))?;
+    let items = value
+        .as_array()
+        .ok_or_else(|| "AI 返回的 JSON 不是数组".to_string())?;
+    let mut created = 0i64;
+    for item in items {
+        let Some(title) = item["title"].as_str().map(str::trim).filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let note = item["note"].as_str().unwrap_or("").trim().to_string();
+        let date = item["date"]
+            .as_str()
+            .map(str::trim)
+            .filter(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").is_ok())
+            .map(str::to_string)
+            .unwrap_or_else(|| tomorrow.clone());
+        let next_fire = db::compute_next_fire("once", "09:00", None, Some(&date))
+            .ok_or_else(|| "计算提醒触发时间失败".to_string())?;
+        with_db(&app, |conn| {
+            db::insert_reminder(
+                conn,
+                title,
+                &note,
+                "once",
+                "09:00",
+                None,
+                Some(&date),
+                &db::fmt_fire_time(&next_fire),
+            )
+        })?;
+        created += 1;
+    }
+    Ok(created)
 }
 
 /// sidecar 不存在或已退出时重新 spawn；本次新起的实例等 ready 事件（10s 超时）。

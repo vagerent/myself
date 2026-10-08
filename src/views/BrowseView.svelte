@@ -48,6 +48,7 @@
   let pnoteStatus: PnoteStatus | null = null;
   let pnoteSyncing = false;
   let pnoteStage = "";
+  let analyzingEvents = false;
   $: weekKey = weekChoice === "last" ? lastWeek() : thisWeek();
 
   const MEETING_STAGE_LABEL: Record<string, string> = {
@@ -190,6 +191,21 @@
       pnoteSyncing = false;
       pnoteStage = "";
       refreshPnoteStatus();
+    }
+  }
+
+  async function analyzeEvents() {
+    if (analyzingEvents) return;
+    analyzingEvents = true;
+    try {
+      const n = await api.analyzeRecorderEvents();
+      showToast(n > 0 ? `已创建 ${n} 条提醒` : "没有识别到值得提醒的事件");
+      refreshStats();
+      loadReminders();
+    } catch (e) {
+      showToast(String(e));
+    } finally {
+      analyzingEvents = false;
     }
   }
 
@@ -832,6 +848,12 @@
           {#if pnoteSyncing}
             <span class="spinner"></span>
             <span class="hint">{pnoteStage || "同步中…"}</span>
+          {/if}
+          <button on:click={analyzeEvents} disabled={analyzingEvents}>
+            {analyzingEvents ? "分析中…" : "分析录音事件"}
+          </button>
+          {#if analyzingEvents}
+            <span class="spinner"></span>
           {/if}
         </div>
       {/if}

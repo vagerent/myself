@@ -120,6 +120,21 @@ pub const DEFAULT_MEETING_DEEP_PROMPT_TEMPLATE: &str = r#"# System Prompt: 深�
 2. **禁止提问**：不输出"请问还缺少什么信息""是否需要调整"等任何询问语句。
 3. **禁止前置对话**：不要输出"好的，我来为您整理"等客套，直接以 `# [会议标题]` 开始输出。"#;
 
+/// 录音事件分析的默认提示词（作为 system 提示词整体发给模型，录音转写片段作为用户消息）。
+pub const DEFAULT_RECORDER_EVENT_PROMPT: &str = r#"你是一名个人助理，负责从我的录音转写片段中找出值得提醒的未来事件。
+
+【输入】最近几天的录音转写片段，每条带有录制日期。
+
+【任务】
+1. 识别其中的承诺、待办、约定、deadline、账单、预约、纪念日、要跟进的人和事。
+2. 只提取「需要我在未来某个时间做某事」的事件；日常记录、感想、已经完成的事不要提取。
+3. 每个事件输出：title（一句话，动词开头，不超过 20 字）、note（上下文细节，引用原话关键信息，不超过 100 字）、date（建议提醒日期 YYYY-MM-DD，推断不出就用最新一条录音的日期往后一天）。
+4. 没有明确行动指向的条目直接丢弃。
+
+【输出】只输出 JSON 数组，不要输出任何其他文字：
+[{"title": "...", "note": "...", "date": "2026-10-10"}]
+没有值得提醒的事件时输出 []。"#;
+
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
@@ -152,6 +167,8 @@ pub struct Settings {
     pub pnote_keep_days: i64,
     /// ffmpeg 路径（留空则不校验时长，转写兜底）
     pub pnote_ffmpeg_path: String,
+    /// 录音事件分析提示词（作为 system 提示词整体发给模型）
+    pub recorder_event_prompt: String,
 }
 
 impl Default for Settings {
@@ -179,6 +196,7 @@ impl Default for Settings {
             pnote_enabled: false,
             pnote_keep_days: 30,
             pnote_ffmpeg_path: String::new(),
+            recorder_event_prompt: DEFAULT_RECORDER_EVENT_PROMPT.into(),
         }
     }
 }

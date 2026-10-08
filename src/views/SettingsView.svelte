@@ -28,6 +28,7 @@
     pnoteEnabled: false,
     pnoteKeepDays: 30,
     pnoteFfmpegPath: "",
+    recorderEventPrompt: "",
   };
   let saving = false;
   let asrStatus: AsrModelStatus | null = null;
@@ -266,6 +267,12 @@
         <label>ffmpeg 路径</label>
         <input type="text" bind:value={form.pnoteFfmpegPath} placeholder="留空则不校验时长" />
         <span class="hint">留空则不校验时长；录音卡同步需要 Windows 蓝牙。</span>
+      </div>
+
+      <div class="field">
+        <label>事件分析提示词</label>
+        <textarea bind:value={form.recorderEventPrompt} rows="4"></textarea>
+        <span class="hint">分析录音时作为 system 提示词；输出必须是 JSON 数组。</span>
       </div>
     {:else}
       <div class="field">

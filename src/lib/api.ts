@@ -74,6 +74,7 @@ export const api = {
   pnoteSyncNow: () => invoke<void>("pnote_sync_now"),
   pnoteFileList: () => invoke<unknown>("pnote_file_list"),
   pnoteSetEnabled: (enabled: boolean) => invoke<void>("pnote_set_enabled", { enabled }),
+  analyzeRecorderEvents: () => invoke<number>("analyze_recorder_events"),
 };
 
 // 记住的窗口状态（大小 + 位置），启动时加载并缓存

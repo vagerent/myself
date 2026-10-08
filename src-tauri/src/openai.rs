@@ -179,6 +179,18 @@ impl OpenAiClient {
         Ok(out)
     }
 
+    /// 录音事件分析：prompt 是完整的 system 提示词（用户可在设置中修改），
+    /// 拼接好的录音转写片段作为用户消息；直接返回模型原始字符串，由调用方抠 JSON。
+    pub async fn recorder_events(&self, transcript: &str, prompt: &str) -> Result<String, String> {
+        let truncated = truncate_middle(transcript, 15000);
+        let out = self.chat(prompt, &truncated).await?;
+        let out = out.trim().to_string();
+        if out.is_empty() {
+            return Err("AI 未返回分析结果".into());
+        }
+        Ok(out)
+    }
+
     /// 根据已有内容（如深度解析结果）补一个 20 字以内的标题，返回纯文本。
     pub async fn generate_title(&self, content: &str) -> Result<String, String> {
         let truncated = truncate_middle(content, 8000);
