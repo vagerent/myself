@@ -16,6 +16,7 @@ AE22 / AE23 各用独立帧缓存，解析后统一分发。
 import asyncio
 import datetime
 import struct
+import sys
 from pathlib import Path
 
 from bleak import BleakClient, BleakScanner, BleakError
