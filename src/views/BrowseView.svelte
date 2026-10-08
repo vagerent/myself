@@ -8,6 +8,7 @@
   import Pagination from "../components/Pagination.svelte";
   import ReminderDetail from "../components/ReminderDetail.svelte";
   import ReminderForm from "../components/ReminderForm.svelte";
+  import SourceIcon from "../components/SourceIcon.svelte";
   import { renderMarkdown } from "../lib/markdown";
   import { pendingReminderFocus, showToast, view } from "../lib/stores";
   import {
@@ -161,7 +162,7 @@
     会议: "🤝",
     其他: "📦",
   };
-  const SOURCE_ICON: Record<string, string> = { clipboard: "📋", manual: "✏️", meeting: "🎙️", recorder: "🎙️" };
+  const SOURCE_ICON: Record<string, string> = { clipboard: "📋", manual: "✏️", meeting: "🎙️" };
 
   function fmtKb(kb: number): string {
     if (kb >= 1048576) return (kb / 1048576).toFixed(1) + " GiB";
@@ -549,7 +550,7 @@
         class:active={selectedKey === `source:${s}`}
         on:click={() => selectNode("source", s)}
       >
-        <span class="tree-label"><span class="tree-icon">{SOURCE_ICON[s] ?? "🗂"}</span><span class="txt">{sourceLabel(s)}</span></span>
+        <span class="tree-label"><span class="tree-icon"><SourceIcon source={s} emoji={SOURCE_ICON[s] ?? "🗂"} /></span><span class="txt">{sourceLabel(s)}</span></span>
         <span class="tree-count">
           {count}
           {#if s === "recorder" && pnoteStatus && pnoteStatus.pending > 0}
