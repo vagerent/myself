@@ -15,7 +15,8 @@ pub fn spawn_background(app: AppHandle) {
     tauri::async_runtime::spawn(clipboard_loop(app.clone()));
     tauri::async_runtime::spawn(idle_preprocess_loop(app.clone()));
     tauri::async_runtime::spawn(summary_scheduler_loop(app.clone()));
-    tauri::async_runtime::spawn(reminder_loop(app));
+    tauri::async_runtime::spawn(reminder_loop(app.clone()));
+    tauri::async_runtime::spawn(pnote_cleanup_loop(app));
 }
 
 fn settings_of(app: &AppHandle) -> Settings {
@@ -63,6 +64,52 @@ async fn clipboard_loop(app: AppHandle) {
                 last_hash = Some(hash);
             }
             Err(e) => log::warn!("剪贴板入库失败: {e}"),
+        }
+    }
+}
+
+/// 文件 mtime 是否早于 days 天前（严格早于边界；days 钳到 ≥0）。
+fn is_older_than(mtime: std::time::SystemTime, days: i64) -> bool {
+    let cutoff = std::time::SystemTime::now()
+        .checked_sub(StdDuration::from_secs(days.max(0) as u64 * 86400))
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    mtime < cutoff
+}
+
+async fn pnote_cleanup_loop(app: AppHandle) {
+    loop {
+        tokio::time::sleep(StdDuration::from_secs(3600)).await;
+        let s = settings_of(&app);
+        if !s.pnote_enabled {
+            continue;
+        }
+        let keep_days = s.pnote_keep_days.max(1);
+        let dir = match app.path().app_data_dir() {
+            Ok(d) => d.join("recorder-audio"),
+            Err(e) => {
+                log::warn!("录音归档目录定位失败: {e}");
+                continue;
+            }
+        };
+        let mut removed = 0usize;
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("ogg") {
+                    continue;
+                }
+                let stale = entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .map(|t| is_older_than(t, keep_days))
+                    .unwrap_or(false);
+                if stale && std::fs::remove_file(&path).is_ok() {
+                    removed += 1;
+                }
+            }
+        }
+        if removed > 0 {
+            log::info!("录音归档清理：删除 {removed} 个超过 {keep_days} 天的 ogg 文件");
         }
     }
 }
@@ -509,6 +556,23 @@ async fn reminder_loop(app: AppHandle) {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn is_older_than_boundary() {
+        let days = 30;
+        let cutoff = std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(days as u64 * 86400))
+            .unwrap();
+        // 边界用 ±5s 裕量：函数内部取 now() 与这里计算存在亚秒级时间差，
+        // 正好相等的断言会 flaky；语义是「严格早于边界才算过期」
+        assert!(is_older_than(cutoff - std::time::Duration::from_secs(5), days));
+        assert!(!is_older_than(cutoff + std::time::Duration::from_secs(5), days));
+        // 远未过期
+        assert!(!is_older_than(
+            std::time::SystemTime::now(),
+            days
+        ));
+    }
 
     #[test]
     fn last_week_range_from_mid_week() {

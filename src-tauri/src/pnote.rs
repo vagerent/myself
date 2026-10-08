@@ -344,6 +344,7 @@ async fn handle_event(app: &AppHandle, v: serde_json::Value) {
                 latest.clone()
             };
             let _ = app.emit("pnote-state", snapshot);
+            maybe_trigger_device_gc(app);
         }
         // file_synced：OGG 已落盘 → 先同步登记 done（ogg_path 阶段），再异步转写入库
         "file_synced" => {
@@ -515,6 +516,81 @@ fn merge_state_event(latest: &mut PnoteStatus, data: &serde_json::Value) {
     if let Some(s) = ev.sleeping {
         latest.sleeping = s;
     }
+}
+
+/// 设备容量不足时向 sidecar 发 gc_device，清掉设备上早已同步完成的录音。
+/// 候选取本地 status='done' 且 ogg 落盘超过 30 天的记录（设备端阈值，与保留天数设置无关）。
+pub async fn maybe_gc_device(app: &AppHandle) {
+    let capacity = {
+        let state = app.state::<AppState>();
+        state
+            .pnote_latest
+            .lock()
+            .ok()
+            .and_then(|latest| latest.capacity)
+    };
+    let Some([remain, total]) = capacity else { return };
+    if total <= 0 || remain * 2 >= total {
+        return;
+    }
+    let candidates = match with_db(app, |conn| db::recorder_files_done_before(conn, 30)) {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("录音卡设备清理候选查询失败: {e}");
+            return;
+        }
+    };
+    if candidates.is_empty() {
+        return;
+    }
+    match pnote_request::<serde_json::Value>(
+        app,
+        "gc_device",
+        serde_json::json!({ "names": candidates }),
+        REQUEST_TIMEOUT,
+    )
+    .await
+    {
+        Ok(data) => {
+            let deleted = data.get("deleted").and_then(|v| v.as_u64()).unwrap_or(0);
+            log::info!("录音卡设备清理：删除 {deleted} 个已同步的旧录音");
+        }
+        Err(e) => log::warn!("录音卡设备清理失败: {e}"),
+    }
+}
+
+/// state 事件触发点：容量低于一半时按天 debounce（同一天最多一次），
+/// 后台 spawn 执行，不阻塞事件循环。
+fn maybe_trigger_device_gc(app: &AppHandle) {
+    let low = {
+        let state = app.state::<AppState>();
+        state
+            .pnote_latest
+            .lock()
+            .ok()
+            .and_then(|latest| latest.capacity)
+            .map(|[remain, total]| total > 0 && remain * 2 < total)
+            .unwrap_or(false)
+    };
+    if !low {
+        return;
+    }
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    {
+        let state = app.state::<AppState>();
+        let mut last = match state.pnote_last_gc.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        if last.as_deref() == Some(today.as_str()) {
+            return;
+        }
+        *last = Some(today);
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        maybe_gc_device(&app).await;
+    });
 }
 
 /// stderr 排空：协议行进日志，其余行保留尾部 6 行做崩溃诊断。

@@ -44,6 +44,8 @@ pub struct AppState {
     pub pnote_req_seq: AtomicU64,
     /// 最近一次 state 事件快照
     pub pnote_latest: Mutex<pnote::PnoteStatus>,
+    /// 上次设备容量 GC 触发日期（yyyy-mm-dd），同一天最多触发一次
+    pub pnote_last_gc: Mutex<Option<String>>,
     /// 挂起的录音卡请求：id → oneshot 发送端
     pub pnote_pending: Mutex<HashMap<u64, oneshot::Sender<serde_json::Value>>>,
     /// 本次 spawn 的 ready 信号（stdout 出现 ready 事件时触发）
@@ -121,6 +123,7 @@ pub fn run() {
                 pnote_stdin: tokio::sync::Mutex::new(None),
                 pnote_req_seq: AtomicU64::new(0),
                 pnote_latest: Mutex::new(pnote::PnoteStatus::default()),
+                pnote_last_gc: Mutex::new(None),
                 pnote_pending: Mutex::new(HashMap::new()),
                 pnote_ready: Mutex::new(None),
                 pnote_busy: AtomicBool::new(false),
