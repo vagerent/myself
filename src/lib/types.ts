@@ -106,6 +106,7 @@ export const SOURCE_LABEL: Record<string, string> = {
   manual: "灵感",
   summary: "汇总",
   meeting: "会议录音",
+  recorder: "录音卡",
 };
 
 export interface AsrModelStatus {

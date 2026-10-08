@@ -13,6 +13,7 @@
   import {
     CATEGORIES,
     type EntryRow,
+    type PnoteStatus,
     type ReminderRow,
     type SearchHit,
     type SummaryRow,
@@ -43,6 +44,9 @@
   let meetingProgress: number | null = null;
   let summaryDate = today();
   let weekChoice: "last" | "this" = "last";
+  let pnoteStatus: PnoteStatus | null = null;
+  let pnoteSyncing = false;
+  let pnoteStage = "";
   $: weekKey = weekChoice === "last" ? lastWeek() : thisWeek();
 
   const MEETING_STAGE_LABEL: Record<string, string> = {
@@ -157,7 +161,39 @@
     会议: "🤝",
     其他: "📦",
   };
-  const SOURCE_ICON: Record<string, string> = { clipboard: "📋", manual: "✏️", meeting: "🎙️" };
+  const SOURCE_ICON: Record<string, string> = { clipboard: "📋", manual: "✏️", meeting: "🎙️", recorder: "🎙️" };
+
+  function fmtKb(kb: number): string {
+    if (kb >= 1048576) return (kb / 1048576).toFixed(1) + " GiB";
+    if (kb >= 1024) return (kb / 1024).toFixed(1) + " MiB";
+    return Math.round(kb) + " KB";
+  }
+
+  async function refreshPnoteStatus() {
+    try {
+      pnoteStatus = await api.pnoteStatus();
+    } catch {
+      // 未启用或 sidecar 未就绪时不报错，面板保持未连接态
+    }
+  }
+
+  async function pnoteSyncNow() {
+    if (pnoteSyncing) return;
+    pnoteSyncing = true;
+    pnoteStage = "正在同步…";
+    try {
+      await api.pnoteSyncNow();
+    } catch (e) {
+      showToast("同步失败：" + String(e));
+    } finally {
+      pnoteSyncing = false;
+      pnoteStage = "";
+      refreshPnoteStatus();
+    }
+  }
+
+  // 选中录音卡来源时刷新一次设备状态
+  $: if (selectedKey === "source:recorder") refreshPnoteStatus();
 
   onMount(async () => {
     await refreshStats();
@@ -199,6 +235,23 @@
       pendingReminderFocus.set(false);
       focusReminders();
     });
+    const unlistenPnoteState = listen<PnoteStatus>("pnote-state", (e) => {
+      pnoteStatus = e.payload;
+    });
+    const unlistenPnoteSynced = listen<{ newEntries?: number; name?: string }>("pnote-synced", (e) => {
+      const n = e.payload?.newEntries;
+      showToast(n != null ? `新增 ${n} 条录音，已转写入库` : `录音 ${e.payload?.name ?? ""} 已同步，待转写`);
+      refreshCurrent();
+      refreshStats();
+      refreshPnoteStatus();
+    });
+    const unlistenPnoteProgress = listen<{ file?: string; received?: number; total?: number }>("pnote-progress", (e) => {
+      const { file, received, total } = e.payload ?? {};
+      pnoteStage =
+        total && received != null
+          ? `正在下载 ${file ?? ""} ${Math.min(100, Math.round((received / total) * 100))}%`
+          : `正在下载 ${file ?? ""}…`;
+    });
     if (get(pendingReminderFocus)) {
       pendingReminderFocus.set(false);
       focusReminders();
@@ -217,6 +270,9 @@
       unlistenMeeting.then((f) => f());
       unlistenFailed.then((f) => f());
       unlisten2.then((f) => f());
+      unlistenPnoteState.then((f) => f());
+      unlistenPnoteSynced.then((f) => f());
+      unlistenPnoteProgress.then((f) => f());
     };
   });
 
@@ -486,7 +542,7 @@
     {/each}
 
     <div class="tree-head"><span>来源</span></div>
-    {#each ["clipboard", "manual", "meeting"] as s}
+    {#each ["clipboard", "manual", "meeting", "recorder"] as s}
       {@const count = stats?.bySource.find((x) => x.key === s)?.count ?? 0}
       <div
         class="tree-item indent"
@@ -494,7 +550,12 @@
         on:click={() => selectNode("source", s)}
       >
         <span class="tree-label"><span class="tree-icon">{SOURCE_ICON[s] ?? "🗂"}</span><span class="txt">{sourceLabel(s)}</span></span>
-        <span class="tree-count">{count}</span>
+        <span class="tree-count">
+          {count}
+          {#if s === "recorder" && pnoteStatus && pnoteStatus.pending > 0}
+            <span class="pnote-pending" title="录音卡中待同步的录音">+{pnoteStatus.pending}</span>
+          {/if}
+        </span>
       </div>
     {/each}
 
@@ -744,6 +805,35 @@
           {/if}
         </div>
       {/if}
+      {#if selectedKey === "source:recorder"}
+        <div class="pnote-panel">
+          {#if pnoteStatus?.connected}
+            <span class="dot ok"></span>
+            <span>
+              已连接 · 电量 {pnoteStatus.battery ?? "—"}{pnoteStatus.charging ? "⚡" : ""}%
+              {#if pnoteStatus.capacity} · 剩余容量 {fmtKb(pnoteStatus.capacity[0])}{/if}
+              {#if pnoteStatus.version} · 固件 {pnoteStatus.version}{/if}
+            </span>
+          {:else if pnoteStatus?.sleeping}
+            <span class="dot warn"></span>
+            <span>设备休眠，按录音卡按键唤醒后自动连接</span>
+          {:else}
+            <span class="dot off"></span>
+            <span>未连接（在「设置 → 录音卡」启用）</span>
+          {/if}
+          <button
+            class="primary"
+            on:click={pnoteSyncNow}
+            disabled={pnoteSyncing || !pnoteStatus?.connected}
+          >
+            立即同步
+          </button>
+          {#if pnoteSyncing}
+            <span class="spinner"></span>
+            <span class="hint">{pnoteStage || "同步中…"}</span>
+          {/if}
+        </div>
+      {/if}
       <div style="display:flex;gap:8px;padding:10px 10px 0;flex-shrink:0;">
         <input
           type="text"
@@ -833,5 +923,29 @@
     padding: 3px 8px;
     font-size: 12px;
     font-weight: 400;
+  }
+
+  .pnote-panel {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    padding: 10px 10px 0;
+    flex-shrink: 0;
+    flex-wrap: wrap;
+    font-size: 13px;
+  }
+
+  .pnote-panel .dot.ok {
+    background: var(--ok);
+  }
+
+  .pnote-panel .dot.warn {
+    background: var(--warn);
+  }
+
+  .pnote-pending {
+    color: var(--warn);
+    font-size: 11px;
+    margin-left: 4px;
   }
 </style>
