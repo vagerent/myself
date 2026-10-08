@@ -5,10 +5,11 @@
 //! docs/plans/2026-10-08-recorder-implementation.md「协议定义」。
 
 use crate::db;
+use crate::meeting;
 use crate::AppState;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
@@ -95,6 +96,7 @@ pub async fn pnote_status(app: AppHandle) -> Result<PnoteStatus, String> {
 }
 
 /// 立即跑一轮同步。响应可能很慢（下载 12MB 约 11 分钟），超时给 20 分钟。
+/// 响应返回后顺带重试此前转写失败且 ogg 仍在本地的记录。
 #[tauri::command]
 pub async fn pnote_sync_now(app: AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
@@ -104,6 +106,9 @@ pub async fn pnote_sync_now(app: AppHandle) -> Result<(), String> {
     let result: Result<serde_json::Value, String> =
         pnote_request(&app, "sync_now", serde_json::json!({}), SYNC_TIMEOUT).await;
     state.pnote_busy.store(false, Ordering::SeqCst);
+    for (name, ogg, seconds, size) in failed_records(&app) {
+        spawn_transcribe(app.clone(), name, ogg, seconds, size);
+    }
     result.map(|_| ())
 }
 
@@ -300,6 +305,17 @@ async fn read_stdout_loop(app: AppHandle, stdout: tokio::process::ChildStdout) {
     }
 }
 
+/// file_synced 事件的 data 字段（name/ogg 必填，seconds/size 缺省按 0 处理）。
+#[derive(Deserialize)]
+struct FileSyncedEvent {
+    name: String,
+    ogg: String,
+    #[serde(default)]
+    seconds: f64,
+    #[serde(default)]
+    size: i64,
+}
+
 async fn handle_event(app: &AppHandle, v: serde_json::Value) {
     let event = v.get("event").and_then(|e| e.as_str()).unwrap_or("");
     let data = v.get("data").cloned().unwrap_or(serde_json::Value::Null);
@@ -329,15 +345,142 @@ async fn handle_event(app: &AppHandle, v: serde_json::Value) {
             };
             let _ = app.emit("pnote-state", snapshot);
         }
-        // file_synced 的入库/转写编排（Task 6）；这里先把事件透传给前端
+        // file_synced：OGG 已落盘 → 先同步登记 done（ogg_path 阶段），再异步转写入库
         "file_synced" => {
-            let _ = app.emit("pnote-synced", data);
+            let ev: FileSyncedEvent = match serde_json::from_value(data) {
+                Ok(e) => e,
+                Err(e) => {
+                    log::warn!("录音卡 file_synced 事件格式错误: {e}");
+                    return;
+                }
+            };
+            let seconds = ev.seconds.round() as i64;
+            // 同步落库必须在 spawn 前完成：sidecar 按本地存在性跳过已收文件，
+            // 这条记录是后续转写/重试的唯一凭据
+            if let Err(e) = with_db(app, |conn| {
+                db::recorder_file_upsert(conn, &ev.name, ev.size, seconds, "done")?;
+                db::recorder_file_mark(conn, &ev.name, "done", None, Some(&ev.ogg))
+            }) {
+                log::warn!("录音卡文件登记失败（{}）: {e}", ev.name);
+            }
+            spawn_transcribe(app.clone(), ev.name, ev.ogg, seconds, ev.size);
         }
         "progress" => {
             let _ = app.emit("pnote-progress", data);
         }
         _ => {}
     }
+}
+
+/// 同步执行一条数据库语句（照 tasks.rs 的 with_db 模式）。
+fn with_db<T>(
+    app: &AppHandle,
+    f: impl FnOnce(&rusqlite::Connection) -> rusqlite::Result<T>,
+) -> Result<T, String> {
+    let state = app.state::<AppState>();
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    f(&conn).map_err(|e| e.to_string())
+}
+
+/// status='failed' 且 ogg 文件仍在本地的记录，供 sync_now 后重试转写。
+fn failed_records(app: &AppHandle) -> Vec<(String, String, i64, i64)> {
+    let rows = with_db(app, |conn| {
+        let mut stmt = conn.prepare(
+            "SELECT name, ogg_path, seconds, size FROM recorder_files WHERE status = 'failed'",
+        )?;
+        let mapped = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
+        })?;
+        mapped.collect::<rusqlite::Result<Vec<_>>>()
+    })
+    .unwrap_or_default();
+    rows.into_iter()
+        .filter_map(|(name, ogg, seconds, size)| match ogg {
+            Some(p) if Path::new(&p).is_file() => Some((name, p, seconds, size)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// 排队一个录音卡转写任务（file_synced 事件与 sync_now 失败重试共用）。
+/// pnote_busy 拿不到（同步/转写进行中）则 5 秒重试、最多等 10 分钟，保证任一时刻
+/// 只有一个转写任务在跑。size 仅在事件入口落库时使用，此处无需再登记。
+fn spawn_transcribe(app: AppHandle, name: String, ogg_path: String, seconds: i64, size: i64) {
+    let _ = size;
+    tauri::async_runtime::spawn(async move {
+        let result = async {
+            {
+                let state = app.state::<AppState>();
+                let mut waited = 0u64;
+                while state.pnote_busy.swap(true, Ordering::SeqCst) {
+                    if waited >= 600 {
+                        return Err("录音卡转写排队超时（同步/转写占用超过 10 分钟）".to_string());
+                    }
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    waited += 5;
+                }
+            }
+            let outcome = transcribe_recorder_file(&app, &name, &ogg_path, seconds).await;
+            app.state::<AppState>()
+                .pnote_busy
+                .store(false, Ordering::SeqCst);
+            outcome
+        }
+        .await;
+        if let Err(e) = result {
+            log::warn!("录音卡转写入库失败（{name}）: {e}");
+            // ogg 与设备原件都保留，标 failed 后由下次 sync_now 重试
+            let _ = with_db(&app, |conn| {
+                db::recorder_file_mark(conn, &name, "failed", None, None)
+            });
+        }
+    });
+}
+
+/// 转写单条录音并写入 entries（source = recorder）。不生成 AI 整理，直接原文入库
+/// （录音卡多为短条目，格式前缀已带时长与文件名）。转写前等 meeting_busy 释放，
+/// 避免与会议导入两个 funasr sidecar 并发（5 秒重试，最多 10 分钟）。
+async fn transcribe_recorder_file(
+    app: &AppHandle,
+    name: &str,
+    ogg_path: &str,
+    seconds: i64,
+) -> Result<(), String> {
+    {
+        let state = app.state::<AppState>();
+        let mut waited = 0u64;
+        while state.meeting_busy.load(Ordering::SeqCst) {
+            if waited >= 600 {
+                return Err("会议导入占用语音识别超过 10 分钟，本次转写放弃".into());
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            waited += 5;
+        }
+    }
+    let transcript = meeting::transcribe_audio(app, Path::new(ogg_path)).await?;
+    let text = format!("（时长约 {seconds} 秒｜文件名 {name}）\n\n{transcript}");
+    let dedup_daily = {
+        let state = app.state::<AppState>();
+        let s = state.settings.lock().map_err(|e| e.to_string())?;
+        s.dedup_scope != "all"
+    };
+    let entry_id = with_db(app, |conn| {
+        db::insert_entry(conn, &text, "recorder", dedup_daily)
+    })?;
+    // 重复内容（entry_id=None）也标 done，entry_id 留空即可
+    with_db(app, |conn| {
+        db::recorder_file_mark(conn, name, "done", entry_id, None)
+    })?;
+    let _ = app.emit(
+        "pnote-synced",
+        serde_json::json!({"newEntries": if entry_id.is_some() { 1 } else { 0 }, "name": name}),
+    );
+    Ok(())
 }
 
 /// 把 state 事件的 data 逐个字段合并进快照；battery==110 表示充电中。
