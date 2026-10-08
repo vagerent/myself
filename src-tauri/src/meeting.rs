@@ -244,11 +244,9 @@ pub async fn import_meeting_audio(app: AppHandle, path: String) -> Result<db::En
     result
 }
 
-async fn import_inner(app: &AppHandle, path: &str) -> Result<db::EntryRow, String> {
-    let src = PathBuf::from(path);
-    if !src.is_file() {
-        return Err("文件不存在".into());
-    }
+/// 转写任意受支持音频文件为文本（ogg/opus 直通 sidecar，其余格式先解码 16k wav）。
+/// 会议导入与录音卡同步共用此入口；进度仍走 meeting-progress 事件。
+pub async fn transcribe_audio(app: &AppHandle, audio: &Path) -> Result<String, String> {
     let root = models_root(app)?;
     if !model_ready(&root) {
         return Err("语音识别模型未下载，请先到「设置 → 会议录音」下载模型".into());
@@ -258,38 +256,50 @@ async fn import_inner(app: &AppHandle, path: &str) -> Result<db::EntryRow, Strin
     let spk_dir = spk_model_dir(app)?;
     let sidecar = sidecar_exe(app)?;
 
-    // 1. 解码为 16kHz 单声道 wav 临时文件
-    emit_progress(app, "decoding", "正在解码音频…", None);
-    let app2 = app.clone();
-    let src2 = src.clone();
-    let samples = tauri::async_runtime::spawn_blocking(move || {
-        let mut last = 0.0f32;
-        decode_file_to_16k(&src2, |frac| {
-            let frac = frac.clamp(0.0, 1.0);
-            if frac - last >= 0.02 || frac >= 1.0 {
-                last = frac;
-                emit_progress(
-                    &app2,
-                    "decoding",
-                    format!("正在解码音频… {}%", (frac * 100.0) as u32),
-                    Some(frac),
-                );
-            }
+    // 1. 准备转写输入：ogg/opus 直接交给 sidecar 读取（libsndfile 原生支持，
+    //    录音卡导出的 16kHz ogg 免转码）；其余格式经 symphonia 解码为 16kHz wav
+    let wav_path: Option<PathBuf> = if is_ogg_opus(audio) {
+        None
+    } else {
+        emit_progress(app, "decoding", "正在解码音频…", None);
+        let app2 = app.clone();
+        let src2 = audio.to_path_buf();
+        let samples = tauri::async_runtime::spawn_blocking(move || {
+            let mut last = 0.0f32;
+            decode_file_to_16k(&src2, |frac| {
+                let frac = frac.clamp(0.0, 1.0);
+                if frac - last >= 0.02 || frac >= 1.0 {
+                    last = frac;
+                    emit_progress(
+                        &app2,
+                        "decoding",
+                        format!("正在解码音频… {}%", (frac * 100.0) as u32),
+                        Some(frac),
+                    );
+                }
+            })
         })
-    })
-    .await
-    .map_err(|e| e.to_string())??;
-    let wav_path = std::env::temp_dir().join(format!(
-        "masaifu_meeting_{}_{}.wav",
-        std::process::id(),
-        chrono::Local::now().timestamp_millis()
-    ));
-    write_wav_16k(&wav_path, &samples)?;
+        .await
+        .map_err(|e| e.to_string())??;
+        let wav_path = std::env::temp_dir().join(format!(
+            "masaifu_meeting_{}_{}.wav",
+            std::process::id(),
+            chrono::Local::now().timestamp_millis()
+        ));
+        write_wav_16k(&wav_path, &samples)?;
+        Some(wav_path)
+    };
+    let audio_path: &Path = match &wav_path {
+        Some(p) => p,
+        None => audio,
+    };
 
     // 2. 调 sidecar 转写（stderr 流式读取，逐块上报真实进度）
     emit_progress(app, "transcribing", "正在启动语音识别…", Some(0.0));
-    let transcribe_result = run_sidecar(app, &sidecar, &model_dir, &vad_dir, &spk_dir, &wav_path).await;
-    let _ = std::fs::remove_file(&wav_path);
+    let transcribe_result = run_sidecar(app, &sidecar, &model_dir, &vad_dir, &spk_dir, audio_path).await;
+    if let Some(p) = &wav_path {
+        let _ = std::fs::remove_file(p);
+    }
     let (status, stdout_bytes, stderr_tail) = transcribe_result?;
     if !status.success() {
         return Err(format!("转写失败: {}", db::clip(&stderr_tail, 300)));
@@ -301,6 +311,15 @@ async fn import_inner(app: &AppHandle, path: &str) -> Result<db::EntryRow, Strin
     if transcript.is_empty() {
         return Err("未识别到有效语音内容".into());
     }
+    Ok(transcript)
+}
+
+async fn import_inner(app: &AppHandle, path: &str) -> Result<db::EntryRow, String> {
+    let src = PathBuf::from(path);
+    if !src.is_file() {
+        return Err("文件不存在".into());
+    }
+    let transcript = transcribe_audio(app, &src).await?;
 
     // 3. 入库（source = meeting）
     let (dedup_daily, settings) = {
@@ -510,6 +529,14 @@ async fn run_sidecar(
     let stdout_bytes = stdout_task.await.map_err(|e| e.to_string())?;
     let stderr_tail = stderr_task.await.map_err(|e| e.to_string())?;
     Ok((status, stdout_bytes, stderr_tail))
+}
+
+/// ogg/opus symphonia 解不了（无 opus 解码器），由 sidecar 的 libsndfile 直接读取
+fn is_ogg_opus(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| matches!(e.to_ascii_lowercase().as_str(), "ogg" | "opus"))
+        .unwrap_or(false)
 }
 
 /// 解码任意常见音频文件为 16kHz 单声道 f32 采样。
