@@ -179,10 +179,10 @@ impl OpenAiClient {
         Ok(out)
     }
 
-    /// 录音事件分析：prompt 是完整的 system 提示词（用户可在设置中修改），
-    /// 拼接好的录音转写片段作为用户消息；直接返回模型原始字符串，由调用方抠 JSON。
-    pub async fn recorder_events(&self, transcript: &str, prompt: &str) -> Result<String, String> {
-        let truncated = truncate_middle(transcript, 15000);
+    /// 录音洞察：prompt 是完整的 system 提示词，拼装好的深度解析+状态+活跃发现作为用户消息；
+    /// 直接返回模型原始字符串，由调用方抠 JSON。
+    pub async fn recorder_insights(&self, user: &str, prompt: &str) -> Result<String, String> {
+        let truncated = truncate_middle(user, 15000);
         let out = self.chat(prompt, &truncated).await?;
         let out = out.trim().to_string();
         if out.is_empty() {

@@ -1,4 +1,5 @@
 use crate::db;
+use crate::insights;
 use crate::openai::OpenAiClient;
 use crate::settings::Settings;
 use crate::AppState;
@@ -15,6 +16,7 @@ pub fn spawn_background(app: AppHandle) {
     tauri::async_runtime::spawn(clipboard_loop(app.clone()));
     tauri::async_runtime::spawn(idle_preprocess_loop(app.clone()));
     tauri::async_runtime::spawn(summary_scheduler_loop(app.clone()));
+    tauri::async_runtime::spawn(insights_scheduler_loop(app.clone()));
     tauri::async_runtime::spawn(reminder_loop(app.clone()));
     tauri::async_runtime::spawn(pnote_cleanup_loop(app));
 }
@@ -259,6 +261,42 @@ async fn summary_scheduler_loop(app: AppHandle) {
                     }
                 }
             }
+        }
+    }
+}
+
+/// 录音洞察间隔调度：30 秒 tick，每轮现读 `recorder_analysis_interval_hours`
+/// （0 = 纯手动，改设置即时生效）；距上次尝试满一个间隔且当前无分析在跑则 fire。
+/// 时间戳记录成功与失败两种尝试，失败不补偿、下轮自然重试。
+async fn insights_scheduler_loop(app: AppHandle) {
+    loop {
+        tokio::time::sleep(StdDuration::from_secs(30)).await;
+        let interval_hours = settings_of(&app).recorder_analysis_interval_hours;
+        if interval_hours <= 0 {
+            continue;
+        }
+        let now = Local::now();
+        let due = {
+            let state = app.state::<AppState>();
+            if state.insights_busy.load(Ordering::SeqCst) {
+                false
+            } else {
+                match state.insights_last_run.lock().unwrap().clone() {
+                    Some(last) => {
+                        now.signed_duration_since(last) >= ChronoDuration::hours(interval_hours)
+                    }
+                    None => true,
+                }
+            }
+        };
+        if !due {
+            continue;
+        }
+        let result = insights::run_insights(&app, "interval").await;
+        *app.state::<AppState>().insights_last_run.lock().unwrap() = Some(Local::now());
+        match result {
+            Ok(()) => log::info!("录音洞察定时分析完成"),
+            Err(e) => log::warn!("录音洞察定时分析失败: {e}"),
         }
     }
 }

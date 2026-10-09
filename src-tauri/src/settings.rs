@@ -120,20 +120,79 @@ pub const DEFAULT_MEETING_DEEP_PROMPT_TEMPLATE: &str = r#"# System Prompt: 深�
 2. **禁止提问**：不输出"请问还缺少什么信息""是否需要调整"等任何询问语句。
 3. **禁止前置对话**：不要输出"好的，我来为您整理"等客套，直接以 `# [会议标题]` 开始输出。"#;
 
-/// 录音事件分析的默认提示词（作为 system 提示词整体发给模型，录音转写片段作为用户消息）。
-pub const DEFAULT_RECORDER_EVENT_PROMPT: &str = r#"你是一名个人助理，负责从我的录音转写片段中找出值得提醒的未来事件。
+/// 录音卡深度解析的默认提示词（作为 system 提示词整体发给模型，录音转写作为用户消息）。
+/// 个人记录导向：按时间线梳理这段录音里这个人做了什么、想到了什么、说了要做什么。
+pub const DEFAULT_RECORDER_DEEP_PROMPT: &str = r#"# 角色
+你是我的个人录音整理助手。我把随手录下的语音转写交给你，你帮我整理成一份属于「我」的个人记录。收到转写后立即直接输出 Markdown，绝不向我提问，绝不寒暄。
 
-【输入】最近几天的录音转写片段，每条带有录制日期。
+# 整理方式
+按时间线梳理这段录音，讲清楚四件事：
+1. **做了什么**：我在这段时间实际做了什么事、推进了什么工作。
+2. **想到了什么**：我冒出的想法、灵感、判断、顾虑、纠结。
+3. **说了要做什么**：我说出口的待办、承诺、约定（对谁、做什么、什么时候），逐条列出。
+4. **涉及的人和数字**：提到的人名或称呼、具体数字、金额、日期、时间点。
 
-【任务】
-1. 识别其中的承诺、待办、约定、deadline、账单、预约、纪念日、要跟进的人和事。
-2. 只提取「需要我在未来某个时间做某事」的事件；日常记录、感想、已经完成的事不要提取。
-3. 每个事件输出：title（一句话，动词开头，不超过 20 字）、note（上下文细节，引用原话关键信息，不超过 100 字）、date（建议提醒日期 YYYY-MM-DD，推断不出就用最新一条录音的日期往后一天）。
-4. 没有明确行动指向的条目直接丢弃。
+# 输出结构（Markdown）
+## 这段录音做了什么
+按时间顺序分点，每点一两句话。
 
-【输出】只输出 JSON 数组，不要输出任何其他文字：
-[{"title": "...", "note": "...", "date": "2026-10-10"}]
-没有值得提醒的事件时输出 []。"#;
+## 想到的事
+想法、灵感、顾虑；没有则写「无」。
+
+## 行动项
+- [ ] 我要做的：……（有明确时间的标注日期）
+- [ ] 别人答应我的：……（谁、答应什么）
+
+## 人和数字
+- 人：……
+- 数字/时间：……
+
+# 规则
+- 只整理转写里真实存在的内容，禁止编造，禁止合理想象补全。
+- 缺失但关键的信息标 `[待补充]`，不要反问。
+- 过滤寒暄、客套、口头禅、语气词；保留行动和想法。
+- 全程用第一人称「我」的视角叙述。
+- 直接以 Markdown 正文开始，不要输出「好的」「以下是」等任何前置话语。"#;
+
+/// 录音洞察分析的默认提示词（作为 system 提示词整体发给模型）。
+/// 用户消息由程序拼装：带日期的深度解析集合 + 上次项目状态 JSON + 已有活跃发现清单。
+pub const DEFAULT_RECORDER_INSIGHT_PROMPT: &str = r#"你是我的个人录音洞察分析助手。用户消息里有三部分输入：
+1. 【深度解析】：若干段我的录音深度解析，每段开头有编号 [N] 和录制日期。
+2. 【上次状态】：上次的项目脉络 JSON（projects + archived），你要在它基础上滚动更新。
+3. 【已有活跃发现】：之前已报告、仍未关闭的发现清单，用于去重。
+
+# 任务
+从这些深度解析里提取值得我记住的发现，并维护跨天的项目脉络状态。
+
+# findings 规则
+每个发现是 JSON 对象：{"kind","title","note","quote","event_date","ref"}
+- kind 只能是以下四种：
+  - "commitment_mine"：我要做的事（我说过我要做什么）
+  - "commitment_other"：别人答应我的事
+  - "idea"：我说过的想法、灵感
+  - "open_loop"：说过要做什么、之后再没被提起的未闭环事项
+- title：不超过 20 字的一句话。
+- note：不超过 100 字，带上下文（什么场景说的、涉及谁）。
+- quote：必须从输入深度解析里逐字摘录的原文短句，让我能回听核验，不许改写。
+- event_date：YYYY-MM-DD，推断不出填 null。
+- ref：该发现出自的输入块编号 [N]。
+- 只提取输入里明确说出的内容，禁止编造、禁止过度推断。
+- 与【已有活跃发现】重复（同一件事）的不要再报。
+
+# open_loop 规则
+【上次状态】里 open_items 中 last_mention 距今超过 7 天、本次输入也未再提及、且没有闭环证据的，产出一条 kind="open_loop" 的发现（只报一次），并在 state 中把该 open_item 的 reported 置为 true。
+
+# state 规则
+state 是滚动更新的项目脉络，结构：
+{"projects":[{"name":"...","thread":[{"date":"YYYY-MM-DD","note":"..."}],"open_items":[{"item":"...","origin_date":"YYYY-MM-DD","last_mention":"YYYY-MM-DD","reported":false}]}],"archived":["..."]}
+- thread：该项目每次被提及追加一条（date + 一句 note），跨天滚动。
+- open_items：未闭环事项台账，last_mention 更新为最近一次提及日期。
+- 距今超过 60 天没有被提及的项目，从 projects 移入 archived（只保留名字）。
+
+# 输出
+只输出一个严格 JSON 对象，不要输出任何其他文字、解释或 Markdown 代码块标记：
+{"findings":[...],"state":{...}}
+没有新发现时 findings 输出 []，state 照常输出。"#;
 
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase", default)]
@@ -169,12 +228,14 @@ pub struct Settings {
     pub pnote_ffmpeg_path: String,
     /// 同步窗口（天）：只同步最近 N 天内开始的录音；0 = 全部
     pub pnote_sync_window_days: i64,
-    /// 录音事件分析提示词（作为 system 提示词整体发给模型）
+    /// 录音洞察分析提示词（作为 system 提示词整体发给模型）
     pub recorder_event_prompt: String,
     /// 录音卡会议纪要提示词（转写文本拼接到其后）；留空跟随 meeting_prompt_template
     pub recorder_minutes_prompt: String,
-    /// 录音卡深度解析提示词（作为 system 提示词整体发给模型）；留空跟随 meeting_deep_prompt_template
+    /// 录音卡深度解析提示词（作为 system 提示词整体发给模型）；留空使用内置个人记录导向提示词
     pub recorder_deep_prompt: String,
+    /// 洞察分析间隔小时数；0=仅手动
+    pub recorder_analysis_interval_hours: i64,
 }
 
 impl Default for Settings {
@@ -203,9 +264,10 @@ impl Default for Settings {
             pnote_keep_days: 30,
             pnote_ffmpeg_path: String::new(),
             pnote_sync_window_days: 2,
-            recorder_event_prompt: DEFAULT_RECORDER_EVENT_PROMPT.into(),
+            recorder_event_prompt: DEFAULT_RECORDER_INSIGHT_PROMPT.into(),
             recorder_minutes_prompt: String::new(),
-            recorder_deep_prompt: String::new(),
+            recorder_deep_prompt: DEFAULT_RECORDER_DEEP_PROMPT.into(),
+            recorder_analysis_interval_hours: 3,
         }
     }
 }
@@ -250,11 +312,11 @@ impl Settings {
         }
     }
 
-    /// 录音卡深度解析提示词：留空跟随「会议录音」的提示词
+    /// 录音卡深度解析提示词：留空使用内置个人记录导向提示词
     pub fn resolve_recorder_deep_prompt(&self) -> &str {
         let p = self.recorder_deep_prompt.trim();
         if p.is_empty() {
-            self.meeting_deep_prompt_template.trim()
+            DEFAULT_RECORDER_DEEP_PROMPT
         } else {
             p
         }
@@ -289,7 +351,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn recorder_prompts_fall_back_to_meeting_when_empty() {
+    fn recorder_prompts_fall_back_when_empty() {
         let mut s = Settings::default();
         s.recorder_minutes_prompt = "  ".into();
         s.recorder_deep_prompt = String::new();
@@ -297,10 +359,7 @@ mod tests {
             s.resolve_recorder_minutes_prompt(),
             s.meeting_prompt_template.trim()
         );
-        assert_eq!(
-            s.resolve_recorder_deep_prompt(),
-            s.meeting_deep_prompt_template.trim()
-        );
+        assert_eq!(s.resolve_recorder_deep_prompt(), DEFAULT_RECORDER_DEEP_PROMPT);
     }
 
     #[test]
@@ -312,7 +371,7 @@ mod tests {
         assert_eq!(s.resolve_recorder_deep_prompt(), "录音专用深度");
     }
 
-    /// 旧 settings.json 没有新字段时必须能反序列化（struct 级 default 兜底为空串）
+    /// 旧 settings.json 没有新字段时必须能反序列化（struct 级 default 兜底）
     #[test]
     fn settings_deserializes_without_recorder_prompt_fields() {
         let s = Settings::default();
@@ -320,12 +379,22 @@ mod tests {
         let obj = v.as_object_mut().unwrap();
         obj.remove("recorderMinutesPrompt");
         obj.remove("recorderDeepPrompt");
+        obj.remove("recorderAnalysisIntervalHours");
         let parsed: Settings = serde_json::from_value(v).unwrap();
         assert_eq!(parsed.recorder_minutes_prompt, "");
-        assert_eq!(parsed.recorder_deep_prompt, "");
+        assert_eq!(parsed.resolve_recorder_deep_prompt(), DEFAULT_RECORDER_DEEP_PROMPT);
+        assert_eq!(parsed.recorder_analysis_interval_hours, 3);
         assert_eq!(
             parsed.resolve_recorder_minutes_prompt(),
             parsed.meeting_prompt_template.trim()
         );
+    }
+
+    /// recorder_event_prompt 复用为录音洞察分析提示词，默认值必须非空
+    #[test]
+    fn recorder_event_prompt_default_is_insight_prompt() {
+        let s = Settings::default();
+        assert_eq!(s.recorder_event_prompt, DEFAULT_RECORDER_INSIGHT_PROMPT);
+        assert!(!s.recorder_event_prompt.trim().is_empty());
     }
 }

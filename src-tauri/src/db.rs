@@ -165,9 +165,41 @@ pub fn init(conn: &Connection) -> rusqlite::Result<()> {
           entry_id INTEGER,
           created_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS recorder_analysis_runs (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          started_at TEXT NOT NULL,
+          trigger TEXT NOT NULL,
+          analyzed_count INTEGER NOT NULL DEFAULT 0,
+          status TEXT NOT NULL DEFAULT 'ok',
+          error TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS recorder_analysis_findings (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          run_id INTEGER NOT NULL REFERENCES recorder_analysis_runs(id),
+          kind TEXT NOT NULL,
+          title TEXT NOT NULL,
+          note TEXT NOT NULL DEFAULT '',
+          quote TEXT NOT NULL DEFAULT '',
+          entry_id INTEGER,
+          event_date TEXT,
+          status TEXT NOT NULL DEFAULT 'new',
+          reminder_id INTEGER,
+          created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS findings_by_run ON recorder_analysis_findings(run_id);
+        CREATE INDEX IF NOT EXISTS findings_by_status ON recorder_analysis_findings(status);
+
+        CREATE TABLE IF NOT EXISTS recorder_project_state (
+          id INTEGER PRIMARY KEY CHECK(id = 1),
+          state_json TEXT NOT NULL DEFAULT '{}',
+          updated_at TEXT NOT NULL
+        );
         "#,
     )?;
     ensure_column(conn, "entries", "deep_analysis", "TEXT")?;
+    ensure_column(conn, "entries", "recorder_analyzed_at", "TEXT")?;
     Ok(())
 }
 
@@ -406,21 +438,6 @@ pub fn entries_for_range(
             ],
             row_to_entry,
         )?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
-}
-
-/// 最近 N 天内录音卡来源（source='recorder'）的条目，按时间升序。
-pub fn recorder_entries_since(conn: &Connection, days: i64) -> rusqlite::Result<Vec<EntryRow>> {
-    use chrono::{Duration, Local};
-    let since = (Local::now() - Duration::days(days))
-        .format("%Y-%m-%d %H:%M:%S")
-        .to_string();
-    let mut stmt = conn.prepare(&format!(
-        "SELECT {ENTRY_COLS} FROM entries WHERE source = 'recorder' AND created_at >= ?1 ORDER BY created_at ASC"
-    ))?;
-    let rows = stmt
-        .query_map(params![since], row_to_entry)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }
@@ -1142,6 +1159,230 @@ pub fn recorder_pending_count(conn: &Connection) -> rusqlite::Result<i64> {
     )
 }
 
+// ---------- 录音洞察 ----------
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InsightsCandidate {
+    pub id: i64,
+    pub created_at: String,
+    pub deep_analysis: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InsightsRunRow {
+    pub id: i64,
+    pub started_at: String,
+    pub trigger: String,
+    pub analyzed_count: i64,
+    pub status: String,
+    pub error: Option<String>,
+    pub findings_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InsightsFindingRow {
+    pub id: i64,
+    pub run_id: i64,
+    pub kind: String,
+    pub title: String,
+    pub note: String,
+    pub quote: String,
+    pub entry_id: Option<i64>,
+    pub event_date: Option<String>,
+    pub status: String,
+    pub reminder_id: Option<i64>,
+    pub created_at: String,
+}
+
+/// 录音洞察候选：录音卡来源、已有深度解析、且尚未分析过的条目，按 id 升序。
+pub fn recorder_analysis_candidates(
+    conn: &Connection,
+    limit: i64,
+) -> rusqlite::Result<Vec<InsightsCandidate>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, created_at, deep_analysis FROM entries
+         WHERE source = 'recorder' AND deep_analysis IS NOT NULL AND deep_analysis != ''
+           AND recorder_analyzed_at IS NULL
+         ORDER BY id ASC LIMIT ?1",
+    )?;
+    let rows = stmt
+        .query_map(params![limit], |r| {
+            Ok(InsightsCandidate {
+                id: r.get(0)?,
+                created_at: r.get(1)?,
+                deep_analysis: r.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// 标记录音条目已被洞察分析过（recorder_analyzed_at 置为当前本地时间）。
+pub fn mark_recorder_analyzed(conn: &Connection, ids: &[i64]) -> rusqlite::Result<usize> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let marks = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(",");
+    let sql = format!("UPDATE entries SET recorder_analyzed_at = ?1 WHERE id IN ({marks})");
+    let mut params: Vec<String> = Vec::with_capacity(ids.len() + 1);
+    params.push(now_str());
+    params.extend(ids.iter().map(|id| id.to_string()));
+    conn.execute(&sql, rusqlite::params_from_iter(params.iter()))
+}
+
+pub fn insert_run(
+    conn: &Connection,
+    trigger: &str,
+    analyzed_count: i64,
+    status: &str,
+    error: Option<&str>,
+) -> rusqlite::Result<i64> {
+    conn.execute(
+        "INSERT INTO recorder_analysis_runs (started_at, trigger, analyzed_count, status, error)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![now_str(), trigger, analyzed_count, status, error],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// 历次洞察运行记录（按 id 降序），附每次 run 的 findings 数。
+pub fn list_runs(conn: &Connection, limit: i64) -> rusqlite::Result<Vec<InsightsRunRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT r.id, r.started_at, r.trigger, r.analyzed_count, r.status, r.error,
+                (SELECT COUNT(*) FROM recorder_analysis_findings f WHERE f.run_id = r.id) AS findings_count
+         FROM recorder_analysis_runs r
+         ORDER BY r.id DESC LIMIT ?1",
+    )?;
+    let rows = stmt
+        .query_map(params![limit], |r| {
+            Ok(InsightsRunRow {
+                id: r.get(0)?,
+                started_at: r.get(1)?,
+                trigger: r.get(2)?,
+                analyzed_count: r.get(3)?,
+                status: r.get(4)?,
+                error: r.get(5)?,
+                findings_count: r.get(6)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn insert_finding(
+    conn: &Connection,
+    run_id: i64,
+    kind: &str,
+    title: &str,
+    note: &str,
+    quote: &str,
+    entry_id: Option<i64>,
+    event_date: Option<&str>,
+) -> rusqlite::Result<i64> {
+    conn.execute(
+        "INSERT INTO recorder_analysis_findings (run_id, kind, title, note, quote, entry_id, event_date, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![run_id, kind, title, note, quote, entry_id, event_date, now_str()],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// 去重判断：存在 kind 相同、标题归一化后相等、且未 dismissed 的 finding。
+/// normalized_title 约定为 trim(lower(title)) 后的值，由调用方计算。
+pub fn finding_exists_dedup(
+    conn: &Connection,
+    kind: &str,
+    normalized_title: &str,
+) -> rusqlite::Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM recorder_analysis_findings
+         WHERE kind = ?1 AND status != 'dismissed' AND trim(lower(title)) = ?2",
+        params![kind, normalized_title],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+pub fn list_findings(conn: &Connection, run_id: i64) -> rusqlite::Result<Vec<InsightsFindingRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, run_id, kind, title, note, quote, entry_id, event_date, status, reminder_id, created_at
+         FROM recorder_analysis_findings WHERE run_id = ?1 ORDER BY id ASC",
+    )?;
+    let rows = stmt
+        .query_map(params![run_id], |r| {
+            Ok(InsightsFindingRow {
+                id: r.get(0)?,
+                run_id: r.get(1)?,
+                kind: r.get(2)?,
+                title: r.get(3)?,
+                note: r.get(4)?,
+                quote: r.get(5)?,
+                entry_id: r.get(6)?,
+                event_date: r.get(7)?,
+                status: r.get(8)?,
+                reminder_id: r.get(9)?,
+                created_at: r.get(10)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// status='new' 的 finding 数（前端徽标）。
+pub fn findings_unread_count(conn: &Connection) -> rusqlite::Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM recorder_analysis_findings WHERE status = 'new'",
+        [],
+        |r| r.get(0),
+    )
+}
+
+pub fn set_finding_status(conn: &Connection, id: i64, status: &str) -> rusqlite::Result<usize> {
+    conn.execute(
+        "UPDATE recorder_analysis_findings SET status = ?1 WHERE id = ?2",
+        params![status, id],
+    )
+}
+
+/// finding 与提醒关联，同时标记为 done。
+pub fn link_finding_reminder(
+    conn: &Connection,
+    id: i64,
+    reminder_id: i64,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        "UPDATE recorder_analysis_findings SET reminder_id = ?1, status = 'done' WHERE id = ?2",
+        params![reminder_id, id],
+    )
+}
+
+/// 读取跨次运行的项目状态 JSON；id=1 行不存在时返回 None。
+pub fn load_project_state(conn: &Connection) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT state_json FROM recorder_project_state WHERE id = 1",
+        [],
+        |r| r.get(0),
+    )
+    .optional()
+}
+
+/// 保存项目状态 JSON（UPSERT id=1）。
+pub fn save_project_state(conn: &Connection, json: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO recorder_project_state (id, state_json, updated_at)
+         VALUES (1, ?1, ?2)
+         ON CONFLICT(id) DO UPDATE SET
+             state_json = excluded.state_json,
+             updated_at = excluded.updated_at",
+        params![json, now_str()],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1226,44 +1467,6 @@ mod tests {
         .unwrap();
         let again = insert_entry(&conn, "同一段内容", "clipboard", false).unwrap();
         assert!(again.is_none(), "全量排重时，隔天同内容不应再入库");
-    }
-
-    #[test]
-    fn recorder_entries_since_filters_source_and_window() {
-        let conn = Connection::open_in_memory().unwrap();
-        init(&conn).unwrap();
-        let old = (Local::now() - chrono::Duration::days(10))
-            .format("%Y-%m-%d %H:%M:%S")
-            .to_string();
-        conn.execute(
-            "INSERT INTO entries (raw_content, content_hash, source, created_at) VALUES (?1, ?2, 'recorder', ?3)",
-            params!["十天前的录音", sha256("十天前的录音"), old],
-        )
-        .unwrap();
-        let yesterday = (Local::now() - chrono::Duration::days(1))
-            .format("%Y-%m-%d %H:%M:%S")
-            .to_string();
-        conn.execute(
-            "INSERT INTO entries (raw_content, content_hash, source, created_at) VALUES (?1, ?2, 'recorder', ?3)",
-            params!["昨天的录音", sha256("昨天的录音"), yesterday.clone()],
-        )
-        .unwrap();
-        // 窗口内的非录音卡来源不应命中
-        conn.execute(
-            "INSERT INTO entries (raw_content, content_hash, source, created_at) VALUES (?1, ?2, 'clipboard', ?3)",
-            params!["昨天的剪贴板", sha256("昨天的剪贴板"), yesterday],
-        )
-        .unwrap();
-        let rows = recorder_entries_since(&conn, 7).unwrap();
-        assert_eq!(rows.len(), 1, "只应命中窗口内的录音卡条目");
-        assert_eq!(rows[0].raw_content, "昨天的录音");
-        assert_eq!(rows[0].source, "recorder");
-        // 再补一条今天的录音，结果应保持时间升序
-        insert_entry(&conn, "今天的录音", "recorder", true).unwrap();
-        let rows = recorder_entries_since(&conn, 7).unwrap();
-        assert_eq!(rows.len(), 2);
-        assert!(rows[0].created_at <= rows[1].created_at);
-        assert_eq!(rows[1].raw_content, "今天的录音");
     }
 
     #[test]
@@ -1426,5 +1629,190 @@ mod tests {
         assert_eq!(names, vec!["old.".to_string()], "只有 ogg mtime 早于 30 天的 done 行才应列入");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn init_adds_insights_tables_and_column_to_old_db() {
+        let conn = Connection::open_in_memory().unwrap();
+        // 模拟老库：entries 表既无 deep_analysis 也无 recorder_analyzed_at，且无洞察相关表
+        conn.execute_batch(
+            "CREATE TABLE entries (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              raw_content TEXT NOT NULL,
+              content_hash TEXT NOT NULL UNIQUE,
+              clean_content TEXT,
+              title TEXT,
+              category TEXT,
+              tags TEXT,
+              source TEXT NOT NULL DEFAULT 'clipboard',
+              processed INTEGER NOT NULL DEFAULT 0,
+              created_at TEXT NOT NULL,
+              processed_at TEXT
+            );",
+        )
+        .unwrap();
+        init(&conn).unwrap();
+        // init 幂等：再跑一次不应报错
+        init(&conn).unwrap();
+        let tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'
+                 AND name IN ('recorder_analysis_runs', 'recorder_analysis_findings', 'recorder_project_state')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 3, "迁移后三张洞察表都应存在");
+        let indexes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index'
+                 AND name IN ('findings_by_run', 'findings_by_status')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexes, 2, "两个 findings 索引都应存在");
+        // 新列可查询（列不存在时 prepare 会直接报错）
+        conn.prepare("SELECT recorder_analyzed_at FROM entries").unwrap();
+    }
+
+    #[test]
+    fn recorder_analysis_candidates_filters_marks_and_limits() {
+        let conn = Connection::open_in_memory().unwrap();
+        init(&conn).unwrap();
+        let a = insert_entry(&conn, "录音A", "recorder", true).unwrap().unwrap();
+        save_deep_analysis(&conn, a, "解析A").unwrap();
+        let b = insert_entry(&conn, "录音B", "recorder", true).unwrap().unwrap();
+        save_deep_analysis(&conn, b, "解析B").unwrap();
+        // 无 deep_analysis 的录音条目：不应入选
+        insert_entry(&conn, "录音C", "recorder", true).unwrap().unwrap();
+        // deep_analysis 为空串：不应入选
+        let d = insert_entry(&conn, "录音D", "recorder", true).unwrap().unwrap();
+        save_deep_analysis(&conn, d, "").unwrap();
+        // 非录音来源：不应入选
+        let e = insert_entry(&conn, "剪贴板E", "clipboard", true).unwrap().unwrap();
+        save_deep_analysis(&conn, e, "解析E").unwrap();
+
+        let rows = recorder_analysis_candidates(&conn, 10).unwrap();
+        assert_eq!(rows.len(), 2, "只有 A、B 两条录音应入选");
+        assert_eq!(rows[0].id, a, "按 id 升序");
+        assert_eq!(rows[1].id, b);
+        assert_eq!(rows[0].deep_analysis, "解析A");
+        assert!(!rows[0].created_at.is_empty());
+
+        // limit 生效
+        let limited = recorder_analysis_candidates(&conn, 1).unwrap();
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].id, a);
+
+        // mark 后不再出现，且时间戳已写入
+        assert_eq!(mark_recorder_analyzed(&conn, &[a, b]).unwrap(), 2);
+        assert!(recorder_analysis_candidates(&conn, 10).unwrap().is_empty());
+        let ts: Option<String> = conn
+            .query_row(
+                "SELECT recorder_analyzed_at FROM entries WHERE id = ?1",
+                params![a],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(ts.unwrap().len() >= 19, "recorder_analyzed_at 应为本地时间字符串");
+        // 空 ids 不报错
+        assert_eq!(mark_recorder_analyzed(&conn, &[]).unwrap(), 0);
+    }
+
+    #[test]
+    fn list_runs_orders_desc_with_findings_count() {
+        let conn = Connection::open_in_memory().unwrap();
+        init(&conn).unwrap();
+        let r1 = insert_run(&conn, "manual", 3, "ok", None).unwrap();
+        insert_finding(&conn, r1, "todo", "事项一", "", "", None, None).unwrap();
+        insert_finding(&conn, r1, "todo", "事项二", "备注", "原文", Some(7), Some("2026-08-20"))
+            .unwrap();
+        let r2 = insert_run(&conn, "schedule", 0, "failed", Some("LLM 超时")).unwrap();
+
+        let runs = list_runs(&conn, 10).unwrap();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].id, r2, "按 id 降序");
+        assert_eq!(runs[0].status, "failed");
+        assert_eq!(runs[0].error.as_deref(), Some("LLM 超时"));
+        assert_eq!(runs[0].findings_count, 0);
+        assert_eq!(runs[1].id, r1);
+        assert_eq!(runs[1].error, None);
+        assert_eq!(runs[1].findings_count, 2, "findings_count 应来自子查询");
+
+        // list_findings 字段往返
+        let findings = list_findings(&conn, r1).unwrap();
+        assert_eq!(findings.len(), 2);
+        assert_eq!(findings[1].title, "事项二");
+        assert_eq!(findings[1].note, "备注");
+        assert_eq!(findings[1].quote, "原文");
+        assert_eq!(findings[1].entry_id, Some(7));
+        assert_eq!(findings[1].event_date.as_deref(), Some("2026-08-20"));
+        assert_eq!(findings[1].status, "new");
+        assert_eq!(findings[1].reminder_id, None);
+    }
+
+    #[test]
+    fn finding_dedup_ignores_case_whitespace_and_dismissed() {
+        let conn = Connection::open_in_memory().unwrap();
+        init(&conn).unwrap();
+        let run = insert_run(&conn, "manual", 1, "ok", None).unwrap();
+        // 标题带大小写和首尾空格；normalized_title 约定为 trim(lower(title))
+        let fid = insert_finding(&conn, run, "todo", "  买牛奶 ", "", "", None, None).unwrap();
+        assert!(
+            finding_exists_dedup(&conn, "todo", "买牛奶").unwrap(),
+            "同 kind、标题归一化后相等，应判重"
+        );
+        assert!(!finding_exists_dedup(&conn, "todo", "买面包").unwrap());
+        assert!(!finding_exists_dedup(&conn, "idea", "买牛奶").unwrap(), "kind 不同不算重复");
+        set_finding_status(&conn, fid, "dismissed").unwrap();
+        assert!(
+            !finding_exists_dedup(&conn, "todo", "买牛奶").unwrap(),
+            "dismissed 后不再判重"
+        );
+    }
+
+    #[test]
+    fn findings_unread_count_tracks_new_and_done() {
+        let conn = Connection::open_in_memory().unwrap();
+        init(&conn).unwrap();
+        let run = insert_run(&conn, "manual", 2, "ok", None).unwrap();
+        let f1 = insert_finding(&conn, run, "todo", "事项一", "", "", None, None).unwrap();
+        let f2 = insert_finding(&conn, run, "todo", "事项二", "", "", None, None).unwrap();
+        assert_eq!(findings_unread_count(&conn).unwrap(), 2);
+
+        set_finding_status(&conn, f1, "done").unwrap();
+        assert_eq!(findings_unread_count(&conn).unwrap(), 1);
+
+        // 关联提醒后同时置 done
+        assert_eq!(link_finding_reminder(&conn, f2, 99).unwrap(), 1);
+        assert_eq!(findings_unread_count(&conn).unwrap(), 0);
+        let rows = list_findings(&conn, run).unwrap();
+        let f2row = rows.iter().find(|r| r.id == f2).unwrap();
+        assert_eq!(f2row.status, "done");
+        assert_eq!(f2row.reminder_id, Some(99));
+    }
+
+    #[test]
+    fn project_state_roundtrip_and_overwrite() {
+        let conn = Connection::open_in_memory().unwrap();
+        init(&conn).unwrap();
+        assert!(load_project_state(&conn).unwrap().is_none(), "未保存过应返回 None");
+        save_project_state(&conn, r#"{"projects":[{"name":"X"}]}"#).unwrap();
+        assert_eq!(
+            load_project_state(&conn).unwrap().as_deref(),
+            Some(r#"{"projects":[{"name":"X"}]}"#)
+        );
+        // 重复 save 覆盖不报错
+        save_project_state(&conn, r#"{"projects":[]}"#).unwrap();
+        assert_eq!(
+            load_project_state(&conn).unwrap().as_deref(),
+            Some(r#"{"projects":[]}"#)
+        );
+        // 整个表只应有 id=1 一行
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM recorder_project_state", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
     }
 }

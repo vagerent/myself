@@ -1,6 +1,7 @@
 mod commands;
 mod db;
 mod hotkey;
+mod insights;
 mod meeting;
 mod openai;
 mod pnote;
@@ -52,6 +53,10 @@ pub struct AppState {
     pub pnote_ready: Mutex<Option<oneshot::Sender<()>>>,
     /// 同步/转写重入守卫
     pub pnote_busy: AtomicBool,
+    /// 洞察分析重入守卫（手动触发与间隔调度共用）
+    pub insights_busy: AtomicBool,
+    /// 上次洞察分析尝试时间（成功/失败都记，调度节流用）
+    pub insights_last_run: Mutex<Option<DateTime<Local>>>,
     /// spawn 串行锁，防并发 command 拉起两个实例
     pub pnote_spawn_lock: tokio::sync::Mutex<()>,
     /// sidecar 代次：重新 spawn 时 +1，旧监控任务看到代次不符即退场
@@ -127,6 +132,8 @@ pub fn run() {
                 pnote_pending: Mutex::new(HashMap::new()),
                 pnote_ready: Mutex::new(None),
                 pnote_busy: AtomicBool::new(false),
+                insights_busy: AtomicBool::new(false),
+                insights_last_run: Mutex::new(None),
                 pnote_spawn_lock: tokio::sync::Mutex::new(()),
                 pnote_gen: AtomicU64::new(0),
             });
@@ -203,7 +210,15 @@ pub fn run() {
             pnote::pnote_connect_now,
             pnote::pnote_apply_settings,
             pnote::pnote_set_enabled,
-            pnote::analyze_recorder_events
+            insights::insights_analyze_now,
+            insights::insights_runs,
+            insights::insights_findings,
+            insights::insights_unread,
+            insights::insights_dismiss,
+            insights::insights_mark_read,
+            insights::insights_to_reminder,
+            insights::insights_to_entry,
+            insights::insights_threads
         ])
         .run(tauri::generate_context!())
         .expect("运行马赛福失败");
