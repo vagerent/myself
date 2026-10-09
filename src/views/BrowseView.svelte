@@ -5,6 +5,7 @@
   import { get } from "svelte/store";
   import { api, clipText, lastWeek, reminderRuleText, reminderStatus, sourceLabel, summaryTitle, thisWeek, today } from "../lib/api";
   import EntryDetail from "../components/EntryDetail.svelte";
+  import InsightsPanel from "../components/InsightsPanel.svelte";
   import Pagination from "../components/Pagination.svelte";
   import ReminderDetail from "../components/ReminderDetail.svelte";
   import ReminderForm from "../components/ReminderForm.svelte";
@@ -49,7 +50,7 @@
   let pnoteSyncing = false;
   let pnoteConnecting = false;
   let pnoteStage = "";
-  let analyzingEvents = false;
+  let insightsUnread = 0;
   $: weekKey = weekChoice === "last" ? lastWeek() : thisWeek();
 
   const MEETING_STAGE_LABEL: Record<string, string> = {
@@ -210,18 +211,35 @@
     }
   }
 
-  async function analyzeEvents() {
-    if (analyzingEvents) return;
-    analyzingEvents = true;
+  async function refreshInsightsUnread() {
     try {
-      const n = await api.analyzeRecorderEvents();
-      showToast(n > 0 ? `已创建 ${n} 条提醒` : "没有识别到值得提醒的事件");
-      refreshStats();
-      loadReminders();
-    } catch (e) {
-      showToast(String(e));
-    } finally {
-      analyzingEvents = false;
+      insightsUnread = await api.insightsUnread();
+    } catch {
+      // 后端不可用时角标保持 0
+    }
+  }
+
+  function selectInsights() {
+    searchQuery = "";
+    aiAnswer = "";
+    current = null;
+    currentSummary = null;
+    currentReminder = null;
+    selectedKey = "insights";
+  }
+
+  // 洞察面板跳转来源条目：打开详情并把侧边栏定位到该条目来源
+  async function openEntryById(id: number) {
+    try {
+      const e = await api.getEntry(id);
+      searchQuery = "";
+      aiAnswer = "";
+      currentSummary = null;
+      currentReminder = null;
+      current = e;
+      selectedKey = `source:${e.source}`;
+    } catch (err) {
+      showToast("读取来源条目失败：" + String(err));
     }
   }
 
@@ -236,7 +254,9 @@
       showToast("读取汇总列表失败：" + String(e));
     }
     loadReminders();
+    refreshInsightsUnread();
     const unlisten = listen("reminder-fired", () => loadReminders());
+    const unlistenInsights = listen("insights-updated", () => refreshInsightsUnread());
     const unlistenSummary = listen<SummaryRow>("summary-done", async (e) => {
       generatingDate = "";
       try {
@@ -298,6 +318,7 @@
       clearInterval(clockTimer);
       clearInterval(countTimer);
       unlisten.then((f) => f());
+      unlistenInsights.then((f) => f());
       unlistenSummary.then((f) => f());
       unlistenStarted.then((f) => f());
       unlistenMeeting.then((f) => f());
@@ -628,6 +649,18 @@
         <span class="tree-count">{weeklySummaries.length}</span>
       </span>
     </div>
+    <div
+      class="tree-item indent"
+      class:active={selectedKey === "insights"}
+      on:click={selectInsights}
+    >
+      <span class="tree-label"><span class="tree-icon">💡</span><span class="txt">录音洞察</span></span>
+      {#if insightsUnread > 0}
+        <span class="tree-count" title="未读洞察">
+          <span class="pnote-pending">+{insightsUnread}</span>
+        </span>
+      {/if}
+    </div>
 
     <div class="tree-head"><span>定时任务</span></div>
     <div
@@ -803,6 +836,8 @@
       <div class="summary-content">
         {@html renderMarkdown(currentSummary.content)}
       </div>
+    {:else if selectedKey === "insights"}
+      <InsightsPanel onOpenEntry={openEntryById} onUnreadChange={refreshInsightsUnread} />
     {:else}
       {#if selectedKey === "category:灵感" || selectedKey === "source:manual"}
         <div style="display:flex;gap:8px;padding:10px 10px 0;flex-shrink:0;">
@@ -869,12 +904,6 @@
           {#if pnoteSyncing}
             <span class="spinner"></span>
             <span class="hint">{pnoteStage || "同步中…"}</span>
-          {/if}
-          <button on:click={analyzeEvents} disabled={analyzingEvents}>
-            {analyzingEvents ? "分析中…" : "分析录音事件"}
-          </button>
-          {#if analyzingEvents}
-            <span class="spinner"></span>
           {/if}
         </div>
       {/if}
