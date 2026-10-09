@@ -109,6 +109,13 @@ pub async fn pnote_file_list(app: AppHandle) -> Result<serde_json::Value, String
     pnote_request(&app, "file_list", serde_json::json!({}), REQUEST_TIMEOUT).await
 }
 
+/// 启动守护循环（幂等：sidecar 已在跑时直接返回 running:true）。
+pub async fn start_daemon(app: &AppHandle) -> Result<(), String> {
+    pnote_request::<serde_json::Value>(app, "start", serde_json::json!({}), REQUEST_TIMEOUT)
+        .await?;
+    Ok(())
+}
+
 /// 启用/停用录音卡同步。启用即拉起 sidecar 并启动守护循环；停用发 stop 后 kill。
 /// 照 commands.rs save_settings 的写法：锁 settings、改字段、调 .save。
 #[tauri::command]
@@ -123,8 +130,7 @@ pub async fn pnote_set_enabled(app: AppHandle, enabled: bool) -> Result<(), Stri
     }
     if enabled {
         ensure_sidecar(&app).await?;
-        pnote_request::<serde_json::Value>(&app, "start", serde_json::json!({}), REQUEST_TIMEOUT)
-            .await?;
+        start_daemon(&app).await?;
     } else {
         stop_and_kill(&app).await;
     }

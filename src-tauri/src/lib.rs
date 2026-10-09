@@ -141,6 +141,11 @@ pub fn run() {
                 tauri::async_runtime::spawn(async move {
                     if let Err(e) = pnote::ensure_sidecar(&app2).await {
                         log::warn!("录音卡组件启动失败（可在设置中重新启用）: {e}");
+                        return;
+                    }
+                    // 只拉起进程还不够：守护循环（定时扫描+自动同步）需要显式 start
+                    if let Err(e) = pnote::start_daemon(&app2).await {
+                        log::warn!("录音卡守护循环启动失败（可在设置中重新启用）: {e}");
                     }
                 });
             }
