@@ -346,19 +346,8 @@ async fn import_inner(app: &AppHandle, path: &str) -> Result<db::EntryRow, Strin
     let processed = if settings.api_key_present() {
         emit_progress(app, "minutes", "正在生成会议纪要…", None);
         let client = OpenAiClient::new(&settings.base_url, &settings.api_key, &settings.model);
-        match client
-            .meeting_minutes(&transcript, &settings.meeting_prompt_template)
-            .await
-        {
-            Ok(p) => {
-                let tags_json = p.tags_json();
-                ProcessedContent {
-                    clean: p.clean,
-                    title: p.title,
-                    category: p.category,
-                    tags_json,
-                }
-            }
+        match minutes_content(&client, &transcript, &settings.meeting_prompt_template).await {
+            Ok(p) => p,
             Err(e) => {
                 log::warn!("会议纪要生成失败，保留原始转写: {e}");
                 minutes_warning = Some(e);
@@ -390,6 +379,72 @@ async fn import_inner(app: &AppHandle, path: &str) -> Result<db::EntryRow, Strin
     }
 }
 
+/// 调模型生成会议纪要内容（不写库）；失败返回 Err。会议导入与录音卡自动分析共用。
+async fn minutes_content(
+    client: &OpenAiClient,
+    transcript: &str,
+    prompt: &str,
+) -> Result<ProcessedContent, String> {
+    let p = client.meeting_minutes(transcript, prompt).await?;
+    let tags_json = p.tags_json();
+    Ok(ProcessedContent {
+        clean: p.clean,
+        title: p.title,
+        category: p.category,
+        tags_json,
+    })
+}
+
+/// 用指定提示词为已有条目生成会议纪要并 mark_processed。
+/// 供录音卡转写后的自动静默分析复用：成功返回 true；无 API Key 或任何失败都
+/// 只记日志返回 false，条目保持原文入库（非致命，不影响同步流程）。
+pub async fn apply_minutes(app: &AppHandle, entry_id: i64, transcript: &str, prompt: &str) -> bool {
+    let settings = {
+        let state = app.state::<AppState>();
+        let guard = state.settings.lock();
+        match guard {
+            Ok(s) => s.clone(),
+            Err(e) => {
+                log::warn!("条目 {entry_id} 读取设置失败，跳过纪要生成: {e}");
+                return false;
+            }
+        }
+    };
+    if !settings.api_key_present() {
+        log::info!("条目 {entry_id} 未配置 API Key，跳过纪要生成（保留原始转写）");
+        return false;
+    }
+    let client = OpenAiClient::new(&settings.base_url, &settings.api_key, &settings.model);
+    let processed = match minutes_content(&client, transcript, prompt).await {
+        Ok(p) => p,
+        Err(e) => {
+            log::warn!("条目 {entry_id} 纪要生成失败，保留原始转写: {e}");
+            return false;
+        }
+    };
+    let result = {
+        let state = app.state::<AppState>();
+        let guard = state.db.lock();
+        match guard {
+            Ok(conn) => db::mark_processed(
+                &conn,
+                entry_id,
+                &processed.clean,
+                &processed.title,
+                &processed.category,
+                &processed.tags_json,
+            )
+            .map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        }
+    };
+    if let Err(e) = result {
+        log::warn!("条目 {entry_id} 纪要写库失败: {e}");
+        return false;
+    }
+    true
+}
+
 /// 生成会议深度解析（异步后台执行，不阻塞 UI；结果落库后返回）。
 /// 同一时间只允许一个解析任务，避免并发打爆 API。
 #[tauri::command]
@@ -400,14 +455,29 @@ pub async fn generate_deep_analysis(app: AppHandle, entry_id: i64) -> Result<Str
             return Err("已有深度解析任务进行中".into());
         }
     }
-    let result = deep_analysis_inner(&app, entry_id).await;
+    let prompt = {
+        let state = app.state::<AppState>();
+        state
+            .settings
+            .lock()
+            .map(|s| s.meeting_deep_prompt_template.clone())
+            .unwrap_or_default()
+    };
+    let result = deep_analysis_with_prompt(&app, entry_id, &prompt).await;
     app.state::<AppState>()
         .deep_busy
         .store(false, Ordering::SeqCst);
     result
 }
 
-async fn deep_analysis_inner(app: &AppHandle, entry_id: i64) -> Result<String, String> {
+/// 深度解析核心（不含 busy 门控，调用方负责串行）：读原文 → 按指定提示词调模型
+/// → 结果落库 → 标题为空时按解析结果补题（补题失败仅记日志）。
+/// 会议命令与录音卡自动分析共用。
+pub async fn deep_analysis_with_prompt(
+    app: &AppHandle,
+    entry_id: i64,
+    prompt: &str,
+) -> Result<String, String> {
     let (transcript, title_missing, settings) = {
         let state = app.state::<AppState>();
         let s = state.settings.lock().map_err(|e| e.to_string())?.clone();
@@ -422,9 +492,7 @@ async fn deep_analysis_inner(app: &AppHandle, entry_id: i64) -> Result<String, S
         return Err("请先在「设置 → AI 服务」中配置 API Key".into());
     }
     let client = OpenAiClient::new(&settings.base_url, &settings.api_key, &settings.model);
-    let analysis = client
-        .meeting_deep_analysis(&transcript, &settings.meeting_deep_prompt_template)
-        .await?;
+    let analysis = client.meeting_deep_analysis(&transcript, prompt).await?;
     {
         let state = app.state::<AppState>();
         let conn = state.db.lock().map_err(|e| e.to_string())?;

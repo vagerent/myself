@@ -171,6 +171,10 @@ pub struct Settings {
     pub pnote_sync_window_days: i64,
     /// 录音事件分析提示词（作为 system 提示词整体发给模型）
     pub recorder_event_prompt: String,
+    /// 录音卡会议纪要提示词（转写文本拼接到其后）；留空跟随 meeting_prompt_template
+    pub recorder_minutes_prompt: String,
+    /// 录音卡深度解析提示词（作为 system 提示词整体发给模型）；留空跟随 meeting_deep_prompt_template
+    pub recorder_deep_prompt: String,
 }
 
 impl Default for Settings {
@@ -200,6 +204,8 @@ impl Default for Settings {
             pnote_ffmpeg_path: String::new(),
             pnote_sync_window_days: 2,
             recorder_event_prompt: DEFAULT_RECORDER_EVENT_PROMPT.into(),
+            recorder_minutes_prompt: String::new(),
+            recorder_deep_prompt: String::new(),
         }
     }
 }
@@ -234,6 +240,26 @@ impl Settings {
         !self.api_key.trim().is_empty()
     }
 
+    /// 录音卡纪要提示词：留空跟随「会议录音」的提示词
+    pub fn resolve_recorder_minutes_prompt(&self) -> &str {
+        let p = self.recorder_minutes_prompt.trim();
+        if p.is_empty() {
+            self.meeting_prompt_template.trim()
+        } else {
+            p
+        }
+    }
+
+    /// 录音卡深度解析提示词：留空跟随「会议录音」的提示词
+    pub fn resolve_recorder_deep_prompt(&self) -> &str {
+        let p = self.recorder_deep_prompt.trim();
+        if p.is_empty() {
+            self.meeting_deep_prompt_template.trim()
+        } else {
+            p
+        }
+    }
+
     pub fn load_or_default(path: &Path) -> (Settings, bool) {
         match fs::read_to_string(path) {
             Ok(s) => match serde_json::from_str::<Settings>(&s) {
@@ -255,5 +281,51 @@ impl Settings {
         let data = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
         fs::write(&tmp, data).map_err(|e| e.to_string())?;
         fs::rename(&tmp, path).map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recorder_prompts_fall_back_to_meeting_when_empty() {
+        let mut s = Settings::default();
+        s.recorder_minutes_prompt = "  ".into();
+        s.recorder_deep_prompt = String::new();
+        assert_eq!(
+            s.resolve_recorder_minutes_prompt(),
+            s.meeting_prompt_template.trim()
+        );
+        assert_eq!(
+            s.resolve_recorder_deep_prompt(),
+            s.meeting_deep_prompt_template.trim()
+        );
+    }
+
+    #[test]
+    fn recorder_prompts_override_when_set() {
+        let mut s = Settings::default();
+        s.recorder_minutes_prompt = "  录音专用纪要  ".into();
+        s.recorder_deep_prompt = "录音专用深度".into();
+        assert_eq!(s.resolve_recorder_minutes_prompt(), "录音专用纪要");
+        assert_eq!(s.resolve_recorder_deep_prompt(), "录音专用深度");
+    }
+
+    /// 旧 settings.json 没有新字段时必须能反序列化（struct 级 default 兜底为空串）
+    #[test]
+    fn settings_deserializes_without_recorder_prompt_fields() {
+        let s = Settings::default();
+        let mut v = serde_json::to_value(&s).unwrap();
+        let obj = v.as_object_mut().unwrap();
+        obj.remove("recorderMinutesPrompt");
+        obj.remove("recorderDeepPrompt");
+        let parsed: Settings = serde_json::from_value(v).unwrap();
+        assert_eq!(parsed.recorder_minutes_prompt, "");
+        assert_eq!(parsed.recorder_deep_prompt, "");
+        assert_eq!(
+            parsed.resolve_recorder_minutes_prompt(),
+            parsed.meeting_prompt_template.trim()
+        );
     }
 }

@@ -599,8 +599,10 @@ fn spawn_transcribe(app: AppHandle, name: String, ogg_path: String, seconds: i64
     });
 }
 
-/// 转写单条录音并写入 entries（source = recorder）。不生成 AI 整理，直接原文入库
-/// （录音卡多为短条目，格式前缀已带时长与文件名）。转写前等 meeting_busy 释放，
+/// 转写单条录音并写入 entries（source = recorder），随后自动静默分析
+/// （AI 纪要 + 深度解析，提示词可在「设置 → 录音卡」改，留空跟随会议录音）。
+/// 分析在 pnote_busy 占用期间内联执行，给同步流水线自然 pacing；
+/// 分析失败一律只记日志，条目保持原文入库。转写前等 meeting_busy 释放，
 /// 避免与会议导入两个 funasr sidecar 并发（5 秒重试，最多 10 分钟）。
 async fn transcribe_recorder_file(
     app: &AppHandle,
@@ -637,7 +639,56 @@ async fn transcribe_recorder_file(
         "pnote-synced",
         serde_json::json!({"newEntries": if entry_id.is_some() { 1 } else { 0 }, "name": name}),
     );
+    // 自动静默分析：纪要 → 深度解析。分析时长不阻塞 UI（事件已发），
+    // 但占着 pnote_busy，避免多个文件的分析并发打 API
+    if let Some(id) = entry_id {
+        analyze_recorder_entry(app, id, &transcript).await;
+    }
     Ok(())
+}
+
+/// 录音卡条目自动静默分析：先用录音卡提示词生成会议纪要，再做深度解析。
+/// deep_busy 与手动深度解析共用串行锁，拿不到则 5 秒重试、最多等 10 分钟；
+/// 任一失败只记日志（非致命），不影响已入库条目与同步流程。
+async fn analyze_recorder_entry(app: &AppHandle, entry_id: i64, transcript: &str) {
+    let settings = {
+        let state = app.state::<AppState>();
+        let guard = state.settings.lock();
+        match guard {
+            Ok(s) => s.clone(),
+            Err(e) => {
+                log::warn!("录音条目 {entry_id} 读取设置失败，跳过自动分析: {e}");
+                return;
+            }
+        }
+    };
+    if !settings.api_key_present() {
+        log::info!("录音条目 {entry_id} 未配置 API Key，跳过自动分析");
+        return;
+    }
+    let minutes_prompt = settings.resolve_recorder_minutes_prompt().to_string();
+    let deep_prompt = settings.resolve_recorder_deep_prompt().to_string();
+    meeting::apply_minutes(app, entry_id, transcript, &minutes_prompt).await;
+    {
+        let state = app.state::<AppState>();
+        let mut waited = 0u64;
+        while state.deep_busy.swap(true, Ordering::SeqCst) {
+            if waited >= 600 {
+                log::warn!("录音条目 {entry_id} 深度解析排队超时（手动解析占用超过 10 分钟），本次跳过");
+                return;
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            waited += 5;
+        }
+    }
+    let result = meeting::deep_analysis_with_prompt(app, entry_id, &deep_prompt).await;
+    app.state::<AppState>()
+        .deep_busy
+        .store(false, Ordering::SeqCst);
+    match result {
+        Ok(_) => log::info!("录音条目 {entry_id} 自动分析完成（纪要 + 深度解析）"),
+        Err(e) => log::warn!("录音条目 {entry_id} 深度解析失败（非致命，保留原文）: {e}"),
+    }
 }
 
 /// 把 state 事件的 data 逐个字段合并进快照；battery==110 表示充电中。
