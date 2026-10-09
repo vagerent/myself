@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { LogicalSize, PhysicalPosition, PhysicalSize } from "@tauri-apps/api/dpi";
 import { availableMonitors, getCurrentWindow } from "@tauri-apps/api/window";
-import type { AsrModelStatus, EntryPage, EntryRow, PnoteStatus, ReminderRow, SearchHit, Settings, SummaryRow, TreeStats } from "./types";
+import type { AsrModelStatus, EntryPage, EntryRow, InsightsFinding, InsightsRun, InsightsThreadsState, InsightsToEntryResult, PnoteStatus, ReminderRow, SearchHit, Settings, SummaryRow, TreeStats } from "./types";
 
 export interface WindowState {
   fullWidth?: number;
@@ -76,7 +76,15 @@ export const api = {
   pnoteSetEnabled: (enabled: boolean) => invoke<void>("pnote_set_enabled", { enabled }),
   pnoteConnectNow: () => invoke<PnoteStatus>("pnote_connect_now"),
   pnoteApplySettings: () => invoke<void>("pnote_apply_settings"),
-  analyzeRecorderEvents: () => invoke<number>("analyze_recorder_events"),
+  insightsAnalyzeNow: () => invoke<void>("insights_analyze_now"),
+  insightsRuns: () => invoke<InsightsRun[]>("insights_runs"),
+  insightsFindings: (runId?: number) => invoke<InsightsFinding[]>("insights_findings", { runId }),
+  insightsUnread: () => invoke<number>("insights_unread"),
+  insightsDismiss: (id: number) => invoke<void>("insights_dismiss", { id }),
+  insightsMarkRead: () => invoke<void>("insights_mark_read"),
+  insightsToReminder: (id: number) => invoke<void>("insights_to_reminder", { id }),
+  insightsToEntry: (id: number) => invoke<InsightsToEntryResult>("insights_to_entry", { id }),
+  insightsThreads: () => invoke<InsightsThreadsState | null>("insights_threads"),
 };
 
 // 记住的窗口状态（大小 + 位置），启动时加载并缓存

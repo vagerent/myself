@@ -25,6 +25,7 @@ export interface Settings {
   recorderEventPrompt: string;
   recorderMinutesPrompt: string;
   recorderDeepPrompt: string;
+  recorderAnalysisIntervalHours: number;
 }
 
 export interface PnoteStatus {
@@ -117,4 +118,57 @@ export interface AsrModelStatus {
   downloaded: boolean;
   path: string;
   sidecarReady: boolean;
+}
+
+export interface InsightsRun {
+  id: number;
+  startedAt: string;
+  trigger: string;
+  analyzedCount: number;
+  status: "ok" | "failed";
+  error: string | null;
+  findingsCount: number;
+}
+
+export interface InsightsFinding {
+  id: number;
+  runId: number;
+  kind: string;
+  title: string;
+  note: string;
+  quote: string;
+  entryId: number | null;
+  eventDate: string | null;
+  status: "new" | "done" | "dismissed";
+  reminderId: number | null;
+  createdAt: string;
+}
+
+export interface InsightsToEntryResult {
+  entryId: number | null;
+  message?: string;
+}
+
+// 项目脉络 state（insights_threads 原样返回的 JSON，字段为 snake_case）
+export interface ThreadItem {
+  date: string;
+  note: string;
+}
+
+export interface InsightsOpenItem {
+  item: string;
+  origin_date: string | null;
+  last_mention: string | null;
+  reported: boolean;
+}
+
+export interface ProjectThread {
+  name: string;
+  thread: ThreadItem[];
+  open_items: InsightsOpenItem[];
+}
+
+export interface InsightsThreadsState {
+  projects: ProjectThread[];
+  archived: ProjectThread[];
 }

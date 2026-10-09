@@ -32,6 +32,7 @@
     recorderEventPrompt: "",
     recorderMinutesPrompt: "",
     recorderDeepPrompt: "",
+    recorderAnalysisIntervalHours: 3,
   };
   let saving = false;
   let asrStatus: AsrModelStatus | null = null;
@@ -289,9 +290,23 @@
       </div>
 
       <div class="field">
-        <label>事件分析提示词</label>
+        <label>洞察分析间隔</label>
+        <select bind:value={form.recorderAnalysisIntervalHours} style="width:140px;">
+          <option value={0}>手动</option>
+          <option value={1}>1 小时</option>
+          <option value={2}>2 小时</option>
+          <option value={3}>3 小时</option>
+          <option value={6}>6 小时</option>
+          <option value={12}>12 小时</option>
+          <option value={24}>24 小时</option>
+        </select>
+        <span class="hint">每隔 N 小时自动分析新产生的深度解析；手动模式仅在洞察页点按钮触发。</span>
+      </div>
+
+      <div class="field">
+        <label>洞察分析提示词</label>
         <textarea bind:value={form.recorderEventPrompt} rows="4"></textarea>
-        <span class="hint">分析录音时作为 system 提示词；输出必须是 JSON 数组。</span>
+        <span class="hint">分析深度解析提取承诺、灵感、未闭环与项目脉络时作为 system 提示词；输出必须是 JSON。</span>
       </div>
 
       <div class="field">
@@ -304,9 +319,9 @@
 
       <div class="field">
         <label>深度解析提示词</label>
-        <textarea bind:value={form.recorderDeepPrompt} rows="4" placeholder="留空则使用「会议录音」的深度解析提示词"></textarea>
+        <textarea bind:value={form.recorderDeepPrompt} rows="4" placeholder="留空则使用内置的个人记录导向提示词"></textarea>
         <span class="hint"
-          >纪要生成后自动做深度解析（议题、决策、行动项、思维导图）；留空跟随「会议录音」的解析提示词。</span
+          >纪要生成后自动做深度解析；留空使用内置的个人记录导向提示词，填入则自定义。</span
         >
       </div>
     {:else}
