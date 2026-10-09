@@ -210,52 +210,66 @@ async fn run_insights_inner(app: &AppHandle, trigger: &str) -> Result<(), String
         .recorder_insights(&user, &settings.recorder_event_prompt)
         .await
         .map_err(|e| format!("AI 分析失败：{e}"))?;
-    // 模型可能在 JSON 前后输出多余文字：抠出所有括号配平的对象，优先取含
-    // findings/state 键的信封对象。比「首 { 到尾 }」稳——模型在 JSON 后再输出
-    // 带括号的补充说明（或第二个 JSON）不会被卷进来。
-    let parsed: serde_json::Value = {
-        let mut fallback: Option<serde_json::Value> = None;
-        let mut envelope: Option<serde_json::Value> = None;
-        for s in extract_json_objects(&raw) {
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(s) else {
-                continue;
-            };
-            if v.get("findings").is_some() || v.get("state").is_some() {
-                envelope = Some(v);
-                break;
+    // 兼容模型直接输出发现裸数组（旧版提示词语义 [{title,note,date}]）：
+    // 映射进新 schema 走同一校验链；state 沿用上次。信封对象扫描兜底其他形态。
+    let (findings, mut state) = if let Some(arr) = extract_leading_array(&raw) {
+        log::info!("洞察分析：模型返回裸发现数组（{} 条），按兼容模式处理", arr.len());
+        let mapped: Vec<serde_json::Value> = arr
+            .iter()
+            .filter_map(legacy_item_to_new_schema)
+            .collect();
+        let state = serde_json::from_str(&state_json)
+            .unwrap_or_else(|_| serde_json::json!({"projects": [], "archived": []}));
+        (parse_findings(&mapped, &ref_map), state)
+    } else {
+        // 模型可能在 JSON 前后输出多余文字：抠出所有括号配平的对象，优先取含
+        // findings/state 键的信封对象。比「首 { 到尾 }」稳——模型在 JSON 后再输出
+        // 带括号的补充说明（或第二个 JSON）不会被卷进来。
+        let parsed: serde_json::Value = {
+            let mut fallback: Option<serde_json::Value> = None;
+            let mut envelope: Option<serde_json::Value> = None;
+            for s in extract_json_objects(&raw) {
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(s) else {
+                    continue;
+                };
+                if v.get("findings").is_some() || v.get("state").is_some() {
+                    envelope = Some(v);
+                    break;
+                }
+                fallback.get_or_insert(v);
             }
-            fallback.get_or_insert(v);
-        }
-        match envelope.or(fallback) {
-            Some(v) if v.get("findings").is_some() || v.get("state").is_some() => v,
-            _ => {
+            match envelope.or(fallback) {
+                Some(v) if v.get("findings").is_some() || v.get("state").is_some() => v,
+                _ => {
+                    log::warn!(
+                        "洞察分析未解析出有效的 findings/state，原始响应前 500 字：{}",
+                        db::clip(&raw, 500)
+                    );
+                    return Err("AI 返回的 JSON 缺少 findings 与 state".into());
+                }
+            }
+        };
+        // 缺 findings/state 降级处理（不整个 run 失败）：findings 按 0 条记，
+        // state 沿用上次；两个都缺在上面已硬失败，避免把条目错误地标为已分析
+        let findings = match parsed.get("findings").and_then(|f| f.as_array()) {
+            Some(arr) => parse_findings(arr, &ref_map),
+            None => {
                 log::warn!(
-                    "洞察分析未解析出有效的 findings/state，原始响应前 500 字：{}",
+                    "AI 返回缺少 findings 数组（按 0 条发现处理），原始响应前 500 字：{}",
                     db::clip(&raw, 500)
                 );
-                return Err("AI 返回的 JSON 缺少 findings 与 state".into());
+                Vec::new()
             }
-        }
-    };
-    // 缺 findings/state 降级处理（不整个 run 失败）：findings 按 0 条记，
-    // state 沿用上次；两个都缺在上面已硬失败，避免把条目错误地标为已分析
-    let findings = match parsed.get("findings").and_then(|f| f.as_array()) {
-        Some(arr) => parse_findings(arr, &ref_map),
-        None => {
-            log::warn!(
-                "AI 返回缺少 findings 数组（按 0 条发现处理），原始响应前 500 字：{}",
-                db::clip(&raw, 500)
-            );
-            Vec::new()
-        }
-    };
-    let mut state = match parsed.get("state").cloned().filter(|s| s.is_object()) {
-        Some(s) => s,
-        None => {
-            log::warn!("AI 返回缺少 state 对象，沿用上次项目状态");
-            serde_json::from_str(&state_json)
-                .unwrap_or_else(|_| serde_json::json!({"projects": [], "archived": []}))
-        }
+        };
+        let state = match parsed.get("state").cloned().filter(|s| s.is_object()) {
+            Some(s) => s,
+            None => {
+                log::warn!("AI 返回缺少 state 对象，沿用上次项目状态");
+                serde_json::from_str(&state_json)
+                    .unwrap_or_else(|_| serde_json::json!({"projects": [], "archived": []}))
+            }
+        };
+        (findings, state)
     };
     prune_state(&mut state);
 
@@ -419,6 +433,66 @@ fn extract_json_objects(raw: &str) -> Vec<&str> {
         }
     }
     out
+}
+
+/// 模型输出以 JSON 数组开头时取出整个数组（容忍尾部多余文字：首 [ 到尾 ]），
+/// 其他形态（含含数组的信封对象）返回 None，交给信封扫描处理。
+fn extract_leading_array(raw: &str) -> Option<Vec<serde_json::Value>> {
+    let mut t = raw.trim();
+    // 去掉可能的 ```json 代码围栏
+    if let Some(rest) = t.strip_prefix("```") {
+        t = rest.trim_start();
+        if let Some(rest) = t.strip_prefix("json") {
+            t = rest.trim_start();
+        }
+    }
+    if !t.starts_with('[') {
+        return None;
+    }
+    let end = t.rfind(']')?;
+    for candidate in [t, &t[..=end]] {
+        if let Ok(serde_json::Value::Array(arr)) = serde_json::from_str::<serde_json::Value>(candidate)
+        {
+            return Some(arr);
+        }
+    }
+    None
+}
+
+/// 旧格式发现元素（{title,note,date}）映射为新 schema：kind 缺省时有合法日期按
+/// 「我要做的」、无日期按「灵感」；date 归一为 event_date。
+fn legacy_item_to_new_schema(item: &serde_json::Value) -> Option<serde_json::Value> {
+    let title = item.get("title")?.as_str()?.trim();
+    if title.is_empty() {
+        return None;
+    }
+    let date = item
+        .get("date")
+        .or_else(|| item.get("event_date"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let kind = item
+        .get("kind")
+        .and_then(|k| k.as_str())
+        .filter(|k| VALID_KINDS.contains(k))
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            let dated = date.as_str().map_or(false, |d| {
+                chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").is_ok()
+            });
+            if dated {
+                "commitment_mine".to_string()
+            } else {
+                "idea".to_string()
+            }
+        });
+    Some(serde_json::json!({
+        "kind": kind,
+        "title": title,
+        "note": item.get("note").and_then(|n| n.as_str()).unwrap_or(""),
+        "quote": item.get("quote").and_then(|q| q.as_str()).unwrap_or(""),
+        "event_date": date,
+    }))
 }
 
 /// 逐条校验模型输出的 findings：kind 合法、title 非空、event_date 必须是
@@ -739,5 +813,35 @@ mod tests {
         assert!(extract_json_objects("没有对象").is_empty());
         assert!(extract_json_objects("").is_empty());
         assert!(extract_json_objects("{\"a\":1").is_empty(), "缺右括号不产出");
+    }
+
+    #[test]
+    fn extract_leading_array_tolerates_trailing_text() {
+        let raw = r#"[
+  {"title":"参加会议","note":"下午两点","date":"2026-10-09"}
+]
+以上是我提取的事件。"#;
+        let arr = extract_leading_array(raw).unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["title"], "参加会议");
+        // 非数组形态返回 None（走信封扫描）
+        assert!(extract_leading_array(r#"{"findings":[]}"#).is_none());
+        assert!(extract_leading_array("什么都没有").is_none());
+    }
+
+    #[test]
+    fn legacy_items_map_into_new_schema() {
+        let items = vec![
+            serde_json::json!({"title":"交报告","note":"周五前","date":"2026-10-11"}),
+            serde_json::json!({"title":"没日期的想法","note":""}),
+            serde_json::json!({"note":"没有标题，应被丢弃"}),
+            serde_json::json!({"title":"  ","note":"空标题，应被丢弃"}),
+        ];
+        let mapped: Vec<serde_json::Value> = items.iter().filter_map(legacy_item_to_new_schema).collect();
+        assert_eq!(mapped.len(), 2);
+        assert_eq!(mapped[0]["kind"], "commitment_mine", "有日期默认我要做的");
+        assert_eq!(mapped[0]["event_date"], "2026-10-11");
+        assert_eq!(mapped[1]["kind"], "idea", "无日期默认灵感");
+        assert!(mapped[1]["event_date"].is_null());
     }
 }

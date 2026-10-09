@@ -194,6 +194,23 @@ state 是滚动更新的项目脉络，结构：
 {"findings":[...],"state":{...}}
 没有新发现时 findings 输出 []，state 照常输出。"#;
 
+/// 旧版「录音事件分析」默认提示词（1.3.0 之前）。仅用于迁移识别：老用户
+/// settings.json 里存的若是这个默认值，加载时替换为洞察提示词；
+/// 用户自己改过的提示词不覆盖。
+const LEGACY_RECORDER_EVENT_PROMPT: &str = r#"你是一名个人助理，负责从我的录音转写片段中找出值得提醒的未来事件。
+
+【输入】最近几天的录音转写片段，每条带有录制日期。
+
+【任务】
+1. 识别其中的承诺、待办、约定、deadline、账单、预约、纪念日、要跟进的人和事。
+2. 只提取「需要我在未来某个时间做某事」的事件；日常记录、感想、已经完成的事不要提取。
+3. 每个事件输出：title（一句话，动词开头，不超过 20 字）、note（上下文细节，引用原话关键信息，不超过 100 字）、date（建议提醒日期 YYYY-MM-DD，推断不出就用最新一条录音的日期往后一天）。
+4. 没有明确行动指向的条目直接丢弃。
+
+【输出】只输出 JSON 数组，不要输出任何其他文字：
+[{"title": "...", "note": "...", "date": "2026-10-10"}]
+没有值得提醒的事件时输出 []。"#;
+
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
@@ -325,7 +342,14 @@ impl Settings {
     pub fn load_or_default(path: &Path) -> (Settings, bool) {
         match fs::read_to_string(path) {
             Ok(s) => match serde_json::from_str::<Settings>(&s) {
-                Ok(st) => (st, false),
+                Ok(mut st) => {
+                    // 老用户迁移：存的还是旧版事件分析默认提示词 → 换成洞察提示词
+                    //（trim 比较，容忍历史保存时的首尾空白差异；自定义内容不覆盖）
+                    if st.recorder_event_prompt.trim() == LEGACY_RECORDER_EVENT_PROMPT.trim() {
+                        st.recorder_event_prompt = DEFAULT_RECORDER_INSIGHT_PROMPT.into();
+                    }
+                    (st, false)
+                }
                 Err(e) => {
                     log::warn!("settings 解析失败: {e}，使用默认值");
                     (Settings::default(), true)
@@ -396,5 +420,25 @@ mod tests {
         let s = Settings::default();
         assert_eq!(s.recorder_event_prompt, DEFAULT_RECORDER_INSIGHT_PROMPT);
         assert!(!s.recorder_event_prompt.trim().is_empty());
+    }
+
+    /// 老用户 settings.json 存的是旧版事件分析默认提示词 → 加载时迁移为洞察提示词
+    #[test]
+    fn legacy_event_prompt_migrates_on_load() {
+        let path = std::env::temp_dir().join(format!("masaifu_settings_migrate_{}.json", std::process::id()));
+        let json = format!(
+            r#"{{"recorderEventPrompt":{}}}"#,
+            serde_json::to_string(LEGACY_RECORDER_EVENT_PROMPT).unwrap()
+        );
+        std::fs::write(&path, json).unwrap();
+        let (s, created) = Settings::load_or_default(&path);
+        assert!(!created);
+        assert_eq!(s.recorder_event_prompt, DEFAULT_RECORDER_INSIGHT_PROMPT);
+
+        // 用户自定义过的提示词不被迁移
+        std::fs::write(&path, r#"{"recorderEventPrompt":"我自己写的提示词"}"#).unwrap();
+        let (s, _) = Settings::load_or_default(&path);
+        assert_eq!(s.recorder_event_prompt, "我自己写的提示词");
+        std::fs::remove_file(&path).ok();
     }
 }
