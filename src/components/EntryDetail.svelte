@@ -24,8 +24,10 @@
   // 有 AI 整理内容且与原文不同时，用页签切换「整理内容 / 原始内容」
   // （组件按 entry.id 重建，创建时确定即可）
   const isMeeting = entry.source === "meeting";
+  // 会议录音与录音卡条目共用纪要/深度解析/朗读页签
+  const analyzable = isMeeting || entry.source === "recorder";
   const hasClean = !!entry.cleanContent && entry.cleanContent !== entry.rawContent;
-  const cleanLabel = isMeeting ? "会议纪要" : "整理后内容";
+  const cleanLabel = analyzable ? "会议纪要" : "整理后内容";
   let tab: "clean" | "raw" | "deep" = hasClean ? "clean" : "raw";
 
   // 深度解析：结果落库，生成过程在后台进行，期间可切换到其他页面
@@ -38,7 +40,7 @@
   async function generateDeep() {
     if (
       !confirm(
-        "深度解析会调用 AI 对会议转写全文做结构化分析（议题、决策、行动项、思维导图），大约需要一两分钟。是否开始？",
+        "深度解析会调用 AI 对转写全文做结构化分析（议题、决策、行动项、思维导图），大约需要一两分钟。是否开始？",
       )
     ) {
       return;
@@ -132,7 +134,7 @@
       </div>
     </div>
   {/if}
-  {#if hasClean || isMeeting}
+  {#if hasClean || analyzable}
     <div class="detail-tabs">
       {#if hasClean}
         <button type="button" class:active={tab === "clean"} on:click={() => (tab = "clean")}>
@@ -142,7 +144,7 @@
       <button type="button" class:active={tab === "raw"} on:click={() => (tab = "raw")}>
         原始内容
       </button>
-      {#if isMeeting}
+      {#if analyzable}
         <button type="button" class:active={tab === "deep"} on:click={() => (tab = "deep")}>
           深度解析
         </button>
@@ -159,10 +161,10 @@
       {/if}
     </div>
   {/if}
-  {#if isMeeting && showSpeak}
+  {#if analyzable && showSpeak}
     <SpeakBar entryId={entry.id} {tab} />
   {/if}
-  {#if tab === "deep" && isMeeting}
+  {#if tab === "deep" && analyzable}
     {#if deepLoading}
       <div class="deep-panel">
         <span class="spinner"></span>
@@ -175,7 +177,7 @@
     {:else}
       <div class="deep-panel">
         <span class="hint">
-          基于会议转写全文，由 AI 生成决策导向的深度纪要：议题拆解、决策与未决项、行动项清单、业务思维导图。
+          基于转写全文，由 AI 生成决策导向的深度纪要：议题拆解、决策与未决项、行动项清单、业务思维导图。
         </span>
         <button class="primary" on:click={generateDeep}>生成深度解析</button>
       </div>
@@ -185,7 +187,7 @@
       {@html renderMarkdown(entry.cleanContent ?? "")}
     </div>
   {:else}
-    {#if !hasClean && !isMeeting}
+    {#if !hasClean && !analyzable}
       <label style="color:var(--text-dim);font-size:12px;">原始内容</label>
     {/if}
     <textarea readonly value={entry.rawContent} style="flex:1;"></textarea>
@@ -196,14 +198,14 @@
       {#if tab === "deep"}
         复制解析
       {:else if hasClean && tab === "clean"}
-        {isMeeting ? "复制纪要" : "复制整理内容"}
+        {analyzable ? "复制纪要" : "复制整理内容"}
       {:else}
         复制原文
       {/if}
     </button>
     <button on:click={onBack}>返回</button>
     <button class="danger" style="margin-left:auto;" on:click={remove}>删除</button>
-    {#if isMeeting && tab === "deep" && deep && !deepLoading}
+    {#if analyzable && tab === "deep" && deep && !deepLoading}
       <button type="button" style="margin-left:auto;" on:click={generateDeep}>重新生成深度解析</button>
     {/if}
   </div>
