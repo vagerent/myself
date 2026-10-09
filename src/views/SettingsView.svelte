@@ -30,6 +30,8 @@
     pnoteFfmpegPath: "",
     pnoteSyncWindowDays: 2,
     recorderEventPrompt: "",
+    recorderMinutesPrompt: "",
+    recorderDeepPrompt: "",
   };
   let saving = false;
   let asrStatus: AsrModelStatus | null = null;
@@ -290,6 +292,22 @@
         <label>事件分析提示词</label>
         <textarea bind:value={form.recorderEventPrompt} rows="4"></textarea>
         <span class="hint">分析录音时作为 system 提示词；输出必须是 JSON 数组。</span>
+      </div>
+
+      <div class="field">
+        <label>AI 纪要提示词</label>
+        <textarea bind:value={form.recorderMinutesPrompt} rows="4" placeholder="留空则使用「会议录音」的纪要提示词"></textarea>
+        <span class="hint"
+          >录音转写入库后自动生成会议纪要；留空跟随「会议录音」的纪要提示词，填入则独立生效。</span
+        >
+      </div>
+
+      <div class="field">
+        <label>深度解析提示词</label>
+        <textarea bind:value={form.recorderDeepPrompt} rows="4" placeholder="留空则使用「会议录音」的深度解析提示词"></textarea>
+        <span class="hint"
+          >纪要生成后自动做深度解析（议题、决策、行动项、思维导图）；留空跟随「会议录音」的解析提示词。</span
+        >
       </div>
     {:else}
       <div class="field">

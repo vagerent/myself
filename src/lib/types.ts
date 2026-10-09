@@ -23,6 +23,8 @@ export interface Settings {
   pnoteFfmpegPath: string;
   pnoteSyncWindowDays: number;
   recorderEventPrompt: string;
+  recorderMinutesPrompt: string;
+  recorderDeepPrompt: string;
 }
 
 export interface PnoteStatus {
