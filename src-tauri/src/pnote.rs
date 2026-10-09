@@ -19,6 +19,8 @@ use tokio::sync::oneshot;
 
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// connect：扫描窗口 30s + 连接/对时/订阅 + 设备信息三查询，放宽到 60s
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 // 全量同步下载 12MB 约 11 分钟，给 20 分钟余量
 const SYNC_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 
@@ -107,6 +109,31 @@ pub async fn pnote_sync_now(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 pub async fn pnote_file_list(app: AppHandle) -> Result<serde_json::Value, String> {
     pnote_request(&app, "file_list", serde_json::json!({}), REQUEST_TIMEOUT).await
+}
+
+/// 立即扫描并连接录音卡（幂等）。供断开/休眠状态下手动重连；
+/// 返回合并 pending 后的最新状态，连接失败返回错误原因。
+#[tauri::command]
+pub async fn pnote_connect_now(app: AppHandle) -> Result<PnoteStatus, String> {
+    let data: serde_json::Value =
+        pnote_request(&app, "connect", serde_json::json!({}), CONNECT_TIMEOUT).await?;
+    // 把 sidecar 返回的快照合入本地并推给前端，面板即刻刷新
+    let state = app.state::<AppState>();
+    let mut status = {
+        let mut latest = state.pnote_latest.lock().map_err(|e| e.to_string())?;
+        merge_state_event(&mut latest, &data);
+        latest.clone()
+    };
+    let pending = {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        db::recorder_pending_count(&conn).map_err(|e| e.to_string())?
+    };
+    status.pending = pending;
+    if let Ok(mut latest) = state.pnote_latest.lock() {
+        *latest = status.clone();
+    }
+    let _ = app.emit("pnote-state", status.clone());
+    Ok(status)
 }
 
 /// 启动守护循环（幂等：sidecar 已在跑时直接返回 running:true）。

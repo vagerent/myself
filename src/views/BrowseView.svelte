@@ -47,6 +47,7 @@
   let weekChoice: "last" | "this" = "last";
   let pnoteStatus: PnoteStatus | null = null;
   let pnoteSyncing = false;
+  let pnoteConnecting = false;
   let pnoteStage = "";
   let analyzingEvents = false;
   $: weekKey = weekChoice === "last" ? lastWeek() : thisWeek();
@@ -191,6 +192,21 @@
       pnoteSyncing = false;
       pnoteStage = "";
       refreshPnoteStatus();
+    }
+  }
+
+  // 断开/休眠状态下手动触发一次扫描连接，不等守护循环的退避间隔
+  async function pnoteConnectNow() {
+    if (pnoteConnecting) return;
+    pnoteConnecting = true;
+    try {
+      const s = await api.pnoteConnectNow();
+      pnoteStatus = s;
+      showToast(s.connected ? "已连接录音卡" : "未找到设备，请按录音卡按键唤醒后重试");
+    } catch (e) {
+      showToast("连接失败：" + String(e));
+    } finally {
+      pnoteConnecting = false;
     }
   }
 
@@ -837,6 +853,11 @@
           {:else}
             <span class="dot off"></span>
             <span>未连接（在「设置 → 录音卡」启用）</span>
+          {/if}
+          {#if pnoteStatus?.running && !pnoteStatus?.connected}
+            <button on:click={pnoteConnectNow} disabled={pnoteConnecting}>
+              {pnoteConnecting ? "连接中…" : "连接录音卡"}
+            </button>
           {/if}
           <button
             class="primary"

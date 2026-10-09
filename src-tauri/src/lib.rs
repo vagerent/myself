@@ -195,6 +195,7 @@ pub fn run() {
             pnote::pnote_status,
             pnote::pnote_sync_now,
             pnote::pnote_file_list,
+            pnote::pnote_connect_now,
             pnote::pnote_set_enabled,
             pnote::analyze_recorder_events
         ])

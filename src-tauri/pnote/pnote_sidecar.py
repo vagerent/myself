@@ -366,6 +366,14 @@ class Daemon:
             await self._refresh_device_info()
         return {"new": new}
 
+    async def connect(self) -> dict:
+        """立即扫描并连接（幂等：已连接时仅刷新设备信息）。
+        供断开/休眠状态下手动重连，不等守护循环的退避间隔。"""
+        async with self._conn_lock:
+            await self._ensure_connected()
+            await self._refresh_device_info()
+        return self.snapshot()
+
     async def gc_device(self, names: list) -> dict:
         async with self._conn_lock:
             pen = await self._ensure_connected()
@@ -396,6 +404,7 @@ async def _handle_request(daemon: Daemon, req: dict):
         "status": daemon.status,
         "file_list": daemon.file_list,
         "sync_now": daemon.sync_now,
+        "connect": daemon.connect,
         "gc_device": lambda: daemon.gc_device(list(req.get("names") or [])),
     }
     handler = handlers.get(cmd)

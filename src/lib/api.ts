@@ -74,6 +74,7 @@ export const api = {
   pnoteSyncNow: () => invoke<void>("pnote_sync_now"),
   pnoteFileList: () => invoke<unknown>("pnote_file_list"),
   pnoteSetEnabled: (enabled: boolean) => invoke<void>("pnote_set_enabled", { enabled }),
+  pnoteConnectNow: () => invoke<PnoteStatus>("pnote_connect_now"),
   analyzeRecorderEvents: () => invoke<number>("analyze_recorder_events"),
 };
 
