@@ -210,16 +210,21 @@ async fn run_insights_inner(app: &AppHandle, trigger: &str) -> Result<(), String
         .recorder_insights(&user, &settings.recorder_event_prompt)
         .await
         .map_err(|e| format!("AI 分析失败：{e}"))?;
-    // 模型可能在 JSON 前后输出多余文字：抠出第一个 '{' 到最后一个 '}' 的对象
-    let start = raw
-        .find('{')
-        .ok_or_else(|| "AI 返回内容中没有找到 JSON 对象".to_string())?;
-    let end = raw
-        .rfind('}')
-        .filter(|&i| i >= start)
+    // 模型可能在 JSON 前后输出多余文字：抠出第一个括号配平的 JSON 对象
+    // （跳过字符串内部的括号）。比「首 { 到尾 }」稳——模型在 JSON 后再输出
+    // 带括号的多余文字（或第二个 JSON）不会被卷进来。
+    let json_str = extract_json_object(&raw)
         .ok_or_else(|| "AI 返回内容中没有找到完整的 JSON 对象".to_string())?;
-    let parsed: serde_json::Value = serde_json::from_str(&raw[start..=end])
-        .map_err(|e| format!("AI 返回的 JSON 解析失败：{e}"))?;
+    let parsed: serde_json::Value = match serde_json::from_str(json_str) {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!(
+                "洞察分析 JSON 解析失败，原始响应前 500 字：{}",
+                db::clip(&raw, 500)
+            );
+            return Err(format!("AI 返回的 JSON 解析失败：{e}"));
+        }
+    };
     let findings_arr = parsed
         .get("findings")
         .and_then(|f| f.as_array())
@@ -350,6 +355,39 @@ fn active_findings_text(rows: &[db::InsightsFindingRow]) -> String {
     } else {
         lines.join("\n")
     }
+}
+
+/// 从模型输出中抠出第一个括号配平的 JSON 对象（跳过字符串内部的括号与转义），
+/// 找不到完整对象返回 None。
+fn extract_json_object(raw: &str) -> Option<&str> {
+    let start = raw.find('{')?;
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut escape = false;
+    for (i, ch) in raw[start..].char_indices() {
+        if in_str {
+            if escape {
+                escape = false;
+            } else if ch == '\\' {
+                escape = true;
+            } else if ch == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_str = true,
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(&raw[start..=start + i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// 逐条校验模型输出的 findings：kind 合法、title 非空、event_date 必须是
@@ -629,5 +667,32 @@ mod tests {
         prune_state(&mut state);
         assert_eq!(state["archived"].as_array().unwrap().len(), 1);
         assert!(state.get("projects").is_none());
+    }
+
+    #[test]
+    fn extract_json_object_takes_first_balanced_object() {
+        // 前后有多余文字 + JSON 后跟着带括号的散文（旧「首{到尾}」会把它卷进来）
+        let raw = r#"好的，结果如下：
+{"findings":[{"kind":"idea","title":"想法"}],"state":{"projects":[]}}
+以上是基于录音的洞察。补充说明：{"备用":"对象"} 不必理会。"#;
+        let out = extract_json_object(raw).unwrap();
+        let v: serde_json::Value = serde_json::from_str(out).unwrap();
+        assert_eq!(v["findings"][0]["title"], "想法");
+        assert!(!out.contains("备用"), "第二个对象和散文不能被卷进来");
+    }
+
+    #[test]
+    fn extract_json_object_skips_braces_in_strings() {
+        let raw = r#"{"note":"他说 {明天} 再来，引号 \" 转义","n":1}"#;
+        let out = extract_json_object(raw).unwrap();
+        let v: serde_json::Value = serde_json::from_str(out).unwrap();
+        assert_eq!(v["n"], 1);
+    }
+
+    #[test]
+    fn extract_json_object_handles_truncated_and_empty() {
+        assert!(extract_json_object("没有对象").is_none());
+        assert!(extract_json_object("").is_none());
+        assert!(extract_json_object("{\"a\":1").is_none(), "缺右括号返回 None");
     }
 }
