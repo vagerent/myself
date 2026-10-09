@@ -21,6 +21,7 @@ export interface Settings {
   pnoteEnabled: boolean;
   pnoteKeepDays: number;
   pnoteFfmpegPath: string;
+  pnoteSyncWindowDays: number;
   recorderEventPrompt: string;
 }
 

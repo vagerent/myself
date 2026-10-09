@@ -143,6 +143,55 @@ pub async fn start_daemon(app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// 按设置计算同步窗口起点（YYYYMMDD 紧凑串；days<=0 表示全部 → None）。
+/// 窗口含今天：days=2 → 起点为昨天，即「今日 + 昨日」。
+fn window_cutoff(days: i64) -> Option<String> {
+    if days <= 0 {
+        return None;
+    }
+    let start = chrono::Local::now().date_naive() - chrono::Duration::days(days - 1);
+    Some(start.format("%Y%m%d").to_string())
+}
+
+/// 把当前同步窗口推给 sidecar（config 命令）。sidecar 未启用/未运行时静默跳过。
+pub async fn push_sync_window(app: &AppHandle) -> Result<(), String> {
+    let days = {
+        let state = app.state::<AppState>();
+        let settings = state.settings.lock().map_err(|e| e.to_string())?;
+        settings.pnote_sync_window_days
+    };
+    if !enabled_or_running(app).await {
+        return Ok(());
+    }
+    let since = window_cutoff(days);
+    pnote_request::<serde_json::Value>(app, "config", serde_json::json!({ "since": since }), REQUEST_TIMEOUT)
+        .await?;
+    Ok(())
+}
+
+/// settings.pnote_enabled 且 sidecar 进程存活时才推窗口
+async fn enabled_or_running(app: &AppHandle) -> bool {
+    let enabled = {
+        let state = app.state::<AppState>();
+        state.settings.lock().map(|s| s.pnote_enabled).unwrap_or(false)
+    };
+    if !enabled {
+        return false;
+    }
+    let state = app.state::<AppState>();
+    let child = state.pnote_child.lock().map(|g| g.is_some()).unwrap_or(false);
+    child
+}
+
+/// 设置页保存后调用：把最新同步窗口推给 sidecar。失败仅记日志（不打断保存）。
+#[tauri::command]
+pub async fn pnote_apply_settings(app: AppHandle) -> Result<(), String> {
+    if let Err(e) = push_sync_window(&app).await {
+        log::warn!("推送录音卡同步窗口失败: {e}");
+    }
+    Ok(())
+}
+
 /// 启用/停用录音卡同步。启用即拉起 sidecar 并启动守护循环；停用发 stop 后 kill。
 /// 照 commands.rs save_settings 的写法：锁 settings、改字段、调 .save。
 #[tauri::command]
@@ -158,6 +207,7 @@ pub async fn pnote_set_enabled(app: AppHandle, enabled: bool) -> Result<(), Stri
     if enabled {
         ensure_sidecar(&app).await?;
         start_daemon(&app).await?;
+        push_sync_window(&app).await?;
     } else {
         stop_and_kill(&app).await;
     }
@@ -856,6 +906,23 @@ async fn stop_and_kill(app: &AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn window_cutoff_days() {
+        let today = chrono::Local::now().date_naive();
+        assert_eq!(window_cutoff(0), None, "0 = 全部同步");
+        assert_eq!(window_cutoff(-3), None);
+        assert_eq!(
+            window_cutoff(1).unwrap(),
+            today.format("%Y%m%d").to_string(),
+            "1 天 = 只今天"
+        );
+        assert_eq!(
+            window_cutoff(2).unwrap(),
+            (today - chrono::Duration::days(1)).format("%Y%m%d").to_string(),
+            "2 天 = 今日 + 昨日"
+        );
+    }
 
     /// 连接成功后 sidecar 实推的 state 事件形状（_refresh_device_info 全量 7 字段）
     #[test]

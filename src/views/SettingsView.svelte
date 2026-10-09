@@ -28,6 +28,7 @@
     pnoteEnabled: false,
     pnoteKeepDays: 30,
     pnoteFfmpegPath: "",
+    pnoteSyncWindowDays: 2,
     recorderEventPrompt: "",
   };
   let saving = false;
@@ -54,6 +55,8 @@
     try {
       await api.saveSettings(form);
       await loadSettings();
+      // 录音卡同步窗口等即时生效项推给 sidecar（未启用时后端静默跳过）
+      api.pnoteApplySettings().catch(() => {});
       showToast("设置已保存");
     } catch (e) {
       showToast("保存失败：" + String(e));
@@ -261,6 +264,20 @@
         <label>本地归档保留天数</label>
         <input type="number" min="1" bind:value={form.pnoteKeepDays} style="width:140px;" />
         <span class="hint">超过天数的 OGG 归档自动删除，已转写入库的条目不受影响。</span>
+      </div>
+
+      <div class="field">
+        <label>同步时间窗口</label>
+        <select bind:value={form.pnoteSyncWindowDays} style="width:140px;">
+          <option value={1}>最近 1 天</option>
+          <option value={2}>最近 2 天</option>
+          <option value={3}>最近 3 天</option>
+          <option value={7}>最近 7 天</option>
+          <option value={0}>全部</option>
+        </select>
+        <span class="hint"
+          >只同步窗口内开始的录音；窗口外的留在设备上不进库，改宽窗口后可自动捞回。</span
+        >
       </div>
 
       <div class="field">

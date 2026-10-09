@@ -167,6 +167,8 @@ pub struct Settings {
     pub pnote_keep_days: i64,
     /// ffmpeg 路径（留空则不校验时长，转写兜底）
     pub pnote_ffmpeg_path: String,
+    /// 同步窗口（天）：只同步最近 N 天内开始的录音；0 = 全部
+    pub pnote_sync_window_days: i64,
     /// 录音事件分析提示词（作为 system 提示词整体发给模型）
     pub recorder_event_prompt: String,
 }
@@ -196,6 +198,7 @@ impl Default for Settings {
             pnote_enabled: false,
             pnote_keep_days: 30,
             pnote_ffmpeg_path: String::new(),
+            pnote_sync_window_days: 2,
             recorder_event_prompt: DEFAULT_RECORDER_EVENT_PROMPT.into(),
         }
     }

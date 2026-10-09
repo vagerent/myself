@@ -146,6 +146,11 @@ pub fn run() {
                     // 只拉起进程还不够：守护循环（定时扫描+自动同步）需要显式 start
                     if let Err(e) = pnote::start_daemon(&app2).await {
                         log::warn!("录音卡守护循环启动失败（可在设置中重新启用）: {e}");
+                        return;
+                    }
+                    // 把同步时间窗口推给 sidecar（无状态过滤：窗口外直接跳过）
+                    if let Err(e) = pnote::push_sync_window(&app2).await {
+                        log::warn!("录音卡同步窗口推送失败: {e}");
                     }
                 });
             }
@@ -196,6 +201,7 @@ pub fn run() {
             pnote::pnote_sync_now,
             pnote::pnote_file_list,
             pnote::pnote_connect_now,
+            pnote::pnote_apply_settings,
             pnote::pnote_set_enabled,
             pnote::analyze_recorder_events
         ])

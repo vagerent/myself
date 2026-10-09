@@ -77,6 +77,7 @@ class Daemon:
         self._libs: _Libs | None = None
         self._fail_cooldown: dict[str, int] = {}  # 文件名 -> 剩余退避轮数（下载失败后置 3）
         self._no_bleak = False  # 无 bleak 环境（调试机）：守护循环以纯休眠模式运行
+        self.since: str | None = None  # 同步窗口：'YYYYMMDD' 紧凑串，只收该日期起的录音；None=全部
         self.state = {
             "running": False,
             "connected": False,
@@ -239,6 +240,9 @@ class Daemon:
         files = await pen.get_file_list()
         new_count = 0
         for e in files:
+            # 同步窗口过滤（无状态：窗口外直接跳过不记录，调宽窗口后可再捞回）
+            if self.since and len(e.name) >= 12 and e.name[4:12] < self.since:
+                continue
             ext = ".ogg" if self.have_ffmpeg else ".opus"
             if (self.out_dir / f"{e.base}{ext}").exists():
                 continue
@@ -374,6 +378,12 @@ class Daemon:
             await self._refresh_device_info()
         return self.snapshot()
 
+    async def config(self, since: str | None = None) -> dict:
+        """更新同步窗口：since 为 'YYYYMMDD' 紧凑串（只收该日起的录音），空/None=全部。"""
+        self.since = since or None
+        log(f"同步窗口：{'全部' if self.since is None else self.since + ' 起'}")
+        return {"since": self.since}
+
     async def gc_device(self, names: list) -> dict:
         async with self._conn_lock:
             pen = await self._ensure_connected()
@@ -405,6 +415,7 @@ async def _handle_request(daemon: Daemon, req: dict):
         "file_list": daemon.file_list,
         "sync_now": daemon.sync_now,
         "connect": daemon.connect,
+        "config": lambda: daemon.config(req.get("since")),
         "gc_device": lambda: daemon.gc_device(list(req.get("names") or [])),
     }
     handler = handlers.get(cmd)
