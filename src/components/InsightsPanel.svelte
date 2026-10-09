@@ -154,6 +154,9 @@
 
 <div class="results" style="padding:10px;">
   {#if tab === "findings"}
+    <div class="hint" style="margin-bottom:8px;">
+      「转提醒」到点叫我做 ·「转条目」存进知识库 ·「忽略」以后不再提 · 带 ⭐ 的未闭环是说过再没提的事
+    </div>
     {#if loading}
       <div class="loading"><span class="spinner"></span>加载中…</div>
     {:else if runs.length === 0}
