@@ -1,6 +1,6 @@
 [package]
 name = "masaifu"
-version = "1.2.0"
+version = "1.2.1"
 description = "马赛福 - 个人数字分身"
 authors = ["vager"]
 edition = "2021"
