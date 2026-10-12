@@ -241,10 +241,11 @@ pub struct Settings {
     pub pnote_enabled: bool,
     /// 录音卡 OGG 归档本地保留天数
     pub pnote_keep_days: i64,
-    /// ffmpeg 路径（留空则不校验时长，转写兜底）
-    pub pnote_ffmpeg_path: String,
     /// 同步窗口（天）：只同步最近 N 天内开始的录音；0 = 全部
     pub pnote_sync_window_days: i64,
+    /// 绑定的录音卡 MAC 地址（空 = 不绑定，按广播名匹配）；解决同名设备串卡
+    #[serde(default)]
+    pub pnote_device_address: String,
     /// 录音洞察分析提示词（作为 system 提示词整体发给模型）
     pub recorder_event_prompt: String,
     /// 录音卡会议纪要提示词（转写文本拼接到其后）；留空跟随 meeting_prompt_template
@@ -279,8 +280,8 @@ impl Default for Settings {
             clipboard_enabled: true,
             pnote_enabled: false,
             pnote_keep_days: 30,
-            pnote_ffmpeg_path: String::new(),
             pnote_sync_window_days: 2,
+            pnote_device_address: String::new(),
             recorder_event_prompt: DEFAULT_RECORDER_INSIGHT_PROMPT.into(),
             recorder_minutes_prompt: String::new(),
             recorder_deep_prompt: DEFAULT_RECORDER_DEEP_PROMPT.into(),

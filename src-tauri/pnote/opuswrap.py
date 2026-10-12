@@ -5,14 +5,15 @@
     块0     = 40 字节文件头（"KA" 开头，其余基本为 0）
     块1..N  = 每块 40 字节 = 一个 20ms Opus 包（16kHz 单声道）
 封装为 OGG 后 ffmpeg/VLC/浏览器均可直接播放，且是无损重打包（不重编码）。
+
+时长校验不依赖 ffmpeg：OGG 页头自带 granule 位置（48kHz 采样时钟），
+ogg_duration_seconds 纯解析页结构即可（RFC 7845：时长 = 末页 granule / 48000）。
 """
 import struct
-import subprocess
-import tempfile
-from pathlib import Path
 
 BLOCK = 40
 SAMPLES_PER_PKT = 960  # 20ms @ 48kHz（Opus 内部时钟）
+GRANULE_RATE = 48000
 
 _CRC_TABLE = []
 for i in range(256):
@@ -63,20 +64,27 @@ def wrap_opus_blocks(data: bytes, serial: int = 0xCB08) -> bytes:
     return b"".join(pages)
 
 
-def verify_ogg(ogg_bytes: bytes, expect_seconds, ffmpeg: Path, tolerance=0.1) -> bool:
-    """用 ffmpeg 实际解码，校验时长与文件列表中的录音时长一致。"""
-    with tempfile.TemporaryDirectory() as td:
-        ogg = Path(td) / "t.ogg"
-        wav = Path(td) / "t.wav"
-        ogg.write_bytes(ogg_bytes)
-        r = subprocess.run(
-            [str(ffmpeg), "-y", "-v", "error", "-i", str(ogg), str(wav)],
-            capture_output=True, timeout=180,
-        )
-        if r.returncode != 0:
-            return False
-        import wave
+def ogg_duration_seconds(ogg_bytes: bytes) -> float | None:
+    """解析 OGG 页头的 granule 位置算时长（秒），不依赖 ffmpeg。
 
-        with wave.open(str(wav), "rb") as w:
-            dur = w.getnframes() / w.getframerate()
-    return abs(dur - expect_seconds) <= max(tolerance, expect_seconds * 0.05)
+    OggOpus 时长 = 最大 granule / 48000（RFC 7845）。封装由本模块自己生成，
+    页结构必然合法；解析失败（截断/非 OGG）返回 None，调用方降级处理。
+    """
+    pos = 0
+    n = len(ogg_bytes)
+    max_granule = -1
+    while pos + 27 <= n:
+        if ogg_bytes[pos : pos + 4] != b"OggS":
+            return None
+        granule = int.from_bytes(ogg_bytes[pos + 6 : pos + 14], "little", signed=True)
+        if granule > max_granule:
+            max_granule = granule
+        nsegs = ogg_bytes[pos + 26]
+        table = pos + 27
+        if table + nsegs > n:
+            return None
+        payload_len = sum(ogg_bytes[table : table + nsegs])
+        pos = table + nsegs + payload_len
+    if max_granule < 0:
+        return None
+    return max_granule / GRANULE_RATE

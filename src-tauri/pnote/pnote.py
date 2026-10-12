@@ -141,21 +141,28 @@ class FileEntry:
         return f"<FileEntry {self.name!r} size={self.size} time={self.time}>"
 
 
-async def find_device(name="cb08", timeout=20, max_age=5.0):
+async def find_device(name="cb08", address=None, timeout=20, max_age=5.0):
     """只响应扫描期间收到的"新鲜"广播，避免 Windows watcher 里的陈旧设备条目。
 
     陈旧条目是之前多次失败的根因：条目还在，但笔已休眠，连上后 GATT 发现不完整。
+    address 传入（绑定 MAC）时只认该地址，忽略广播名——同名设备再多也只连绑定的那张。
     """
     import time
+
+    want_addr = (address or "").strip().upper()
 
     holder = {}
     found = asyncio.Event()
 
     def cb(d, ad):
-        if (ad.local_name or d.name or "").lower() == name.lower():
-            holder["device"] = d
-            holder["at"] = time.monotonic()
-            found.set()
+        if want_addr:
+            if (d.address or "").upper() != want_addr:
+                return
+        elif (ad.local_name or d.name or "").lower() != name.lower():
+            return
+        holder["device"] = d
+        holder["at"] = time.monotonic()
+        found.set()
 
     scanner = BleakScanner(detection_callback=cb)
     await scanner.start()
@@ -176,8 +183,10 @@ async def find_device(name="cb08", timeout=20, max_age=5.0):
 
 
 class PNoteClient:
-    def __init__(self, device):
+    def __init__(self, device, name="cb08", address=None):
         self.device = device
+        self.device_name = name
+        self.device_address = address
         self.seq = 0
         self.events = asyncio.Queue()  # (type, cmd, args, source_uuid)
         self._parser_a = FrameParser(lambda s, p: self._dispatch(p, CHAR_NOTIFY_A))
@@ -197,7 +206,8 @@ class PNoteClient:
         last_err = None
         for attempt in range(1, retries + 1):
             if device is None:
-                device = await find_device(timeout=20)
+                device = await find_device(name=self.device_name,
+                                           address=self.device_address, timeout=20)
                 if device is None:
                     last_err = RuntimeError("扫描不到录音笔")
                     log(f"connect: 第 {attempt} 次：扫不到新鲜广播")

@@ -55,6 +55,10 @@ const MODEL_FILES: &[(&str, &str)] = &[
 /// 转写子进程最长允许运行时间（长音频可能很慢）。
 const TRANSCRIBE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
+/// 音频中未识别到语音时的错误标识；录音卡同步据此把文件标记为 skipped（不再重试），
+/// 与转写管线故障区分。值为完整错误串，调用方用相等比较判断。
+pub const NO_SPEECH_ERROR: &str = "未识别到有效语音内容";
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AsrModelStatus {
@@ -309,7 +313,7 @@ pub async fn transcribe_audio(app: &AppHandle, audio: &Path) -> Result<String, S
         .map_err(|e| format!("转写结果解析失败: {e}"))?;
     let transcript = v["text"].as_str().unwrap_or("").trim().to_string();
     if transcript.is_empty() {
-        return Err("未识别到有效语音内容".into());
+        return Err(NO_SPEECH_ERROR.into());
     }
     Ok(transcript)
 }

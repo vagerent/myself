@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """马赛福录音卡守护 sidecar。
 
-常驻进程：BLE 长连接挂住录音卡，轮询文件列表并增量下载（OGG 封装 + ffmpeg 时长校验；
-校验异常降级为非致命直接保存，下载失败退避 3 轮防死循环重下）。
+常驻进程：BLE 长连接挂住录音卡，轮询文件列表并增量下载（纯 Python OGG 封装 +
+页结构时长校验，不依赖 ffmpeg；校验异常降级为非致命直接保存，下载失败退避 3 轮防死循环重下）。
 守护主循环移植自 录音卡/pnote_sync/daemon.py，退出由 stop_event 驱动（替代 KeyboardInterrupt）。
 
 控制通道（JSON-lines，stdout 只出协议行，日志全走 stderr）：
@@ -11,7 +11,7 @@
     stdout 事件:         {"type": "event", "event": "ready|state|progress|file_synced", "data": {...}}
 
 用法:
-    python pnote_sidecar.py --out-dir <OGG归档目录> [--ffmpeg <路径>] [--device-name cb08]
+    python pnote_sidecar.py --out-dir <OGG归档目录> [--device-name cb08]
 退出: stdin EOF 或 {"cmd": "shutdown"}，退出码 0。
 """
 import argparse
@@ -63,11 +63,10 @@ class Daemon:
     连接类操作全部经 _conn_lock 串行（守护循环与 sync_now/file_list/gc_device 不会并发抢连接）。
     """
 
-    def __init__(self, out_dir: Path, ffmpeg: Path | None, device_name: str, poll: float):
+    def __init__(self, out_dir: Path, device_name: str, poll: float):
         self.out_dir = out_dir
-        self.ffmpeg = ffmpeg
-        self.have_ffmpeg = ffmpeg is not None and ffmpeg.exists()
         self.device_name = device_name
+        self.device_address: str | None = None  # 绑定 MAC：设置后只连这张卡（None=按名字匹配）
         self.poll = poll
         self.pen = None
         self.running = False
@@ -86,6 +85,7 @@ class Daemon:
             "capacity": None,
             "version": None,
             "sleeping": False,
+            "device_address": None,
         }
 
     # ---- 模块加载（bleak 延迟到真正连接时）----
@@ -94,7 +94,7 @@ class Daemon:
         if self._libs is None:
             try:
                 from bleak import BleakError
-                from opuswrap import verify_ogg, wrap_opus_blocks
+                from opuswrap import ogg_duration_seconds, wrap_opus_blocks
                 from pnote import PNoteClient, find_device
             except ImportError as e:
                 raise RuntimeError(f"蓝牙组件 bleak 不可用：{e}") from e
@@ -103,7 +103,7 @@ class Daemon:
             libs.PNoteClient = PNoteClient
             libs.find_device = find_device
             libs.wrap_opus_blocks = wrap_opus_blocks
-            libs.verify_ogg = verify_ogg
+            libs.ogg_duration_seconds = ogg_duration_seconds
             self._libs = libs
         return self._libs
 
@@ -124,7 +124,7 @@ class Daemon:
 
     def _clear_device_state(self):
         self._push_state(connected=False, battery=None, charging=False,
-                         capacity=None, version=None)
+                         capacity=None, version=None, device_address=None)
 
     def snapshot(self) -> dict:
         return dict(self.state)
@@ -174,17 +174,20 @@ class Daemon:
         if self._no_bleak:
             raise DeviceNotFound("bleak 不可用，无法扫描设备")
         libs = self._load_libs()
-        device = await libs.find_device(name=self.device_name, timeout=scan_seconds)
+        device = await libs.find_device(name=self.device_name,
+                                        address=self.device_address,
+                                        timeout=scan_seconds)
         if device is None:
             raise DeviceNotFound(f"扫描 {scan_seconds:.0f} 秒未发现录音卡（休眠或不在范围内）")
         log(f"发现设备 {device.name} ({device.address})，正在连接...")
-        pen = libs.PNoteClient(device)
+        pen = libs.PNoteClient(device, name=self.device_name, address=self.device_address)
         await pen.connect(device)
         log("连接成功，正在对时...")
         await pen.sync_time()
         log("对时完成，启动事件路由")
         pen.start_event_router()  # 按键回执依赖（pnote.py 事件路由，断开前须 stop）
         self.pen = pen
+        self._push_state(device_address=device.address)
         await self._refresh_device_info()
         return pen
 
@@ -192,8 +195,9 @@ class Daemon:
 
     async def _download_one(self, pen, entry) -> Path:
         libs = self._libs
-        ext = ".ogg" if self.have_ffmpeg else ".opus"
-        out_path = self.out_dir / f"{entry.base}{ext}"
+        # 封装是纯 Python 无损重打包（opuswrap），不依赖 ffmpeg，必须总是做：
+        # 设备原始字节流是私有 40B 块容器，不封装的话任何播放器/转写器都读不了
+        out_path = self.out_dir / f"{entry.base}.ogg"
         log(f">>> 下载 {entry.name}（{entry.size / 1024:.0f} KB，约 {entry.time} 秒音频）...")
         total = entry.size
         last = [0]
@@ -204,20 +208,25 @@ class Daemon:
                 emit("progress", {"file": entry.name, "received": n, "total": total})
 
         data, _used = await pen.download(entry, preferred=".opus", on_progress=on_progress)
-        content = libs.wrap_opus_blocks(data) if self.have_ffmpeg else data
-        verify_state = "raw"  # verified=时长一致 / skipped=校验异常跳过 / mismatch=时长不符 / raw=未校验
-        if self.have_ffmpeg:
-            try:
-                verify_state = "verified" if libs.verify_ogg(content, entry.time, self.ffmpeg) else "mismatch"
-            except Exception as e:  # noqa: BLE001 - 校验超时/失败不阻塞保存，转写环节兜底
-                log(f"⚠ 时长校验失败/超时（{type(e).__name__}: {e}），跳过校验直接保存（转写环节会兜底验证内容）")
-                verify_state = "skipped"
-            if verify_state == "mismatch":
-                raise ValueError(f"解码校验失败：时长与列表值 {entry.time}s 不符，未保存")
+        content = libs.wrap_opus_blocks(data)
+        # verified=时长一致 / skipped=页结构解析失败跳过 / mismatch=时长不符
+        # 时长来自 OGG 页头 granule（纯解析，不依赖 ffmpeg）；不符仅警告仍保存
+        # （个别固件 time 字段是时间戳，抛错会中止整轮同步并反复重下）
+        duration = libs.ogg_duration_seconds(content)
+        if duration is None:
+            log("⚠ OGG 页结构解析失败（文件截断？），跳过时长校验直接保存（转写环节兜底）")
+            verify_state = "skipped"
+        elif abs(duration - entry.time) <= max(0.1, entry.time * 0.05):
+            verify_state = "verified"
+        else:
+            verify_state = "mismatch"
+            log(f"⚠ 时长校验不符（OGG 解析 {duration:.1f}s 与列表值 {entry.time}s 不一致，"
+                f"个别固件 time 字段异常），仍保存")
         tmp = out_path.with_name(out_path.name + ".part")  # 先写 .part 再 rename，防半截文件
         tmp.write_bytes(content)
         tmp.rename(out_path)
-        kind = {"verified": "OGG/Opus，已校验", "skipped": "OGG/Opus，时长校验跳过", "raw": "裸 Opus"}[verify_state]
+        kind = {"verified": "OGG/Opus，已校验", "skipped": "OGG/Opus，时长校验跳过",
+                "mismatch": "OGG/Opus，时长校验不符"}[verify_state]
         log(f"✓ 已保存 {out_path.name}（{len(data) / 1024:.0f} KB，{kind}）")
         return out_path
 
@@ -243,8 +252,7 @@ class Daemon:
             # 同步窗口过滤（无状态：窗口外直接跳过不记录，调宽窗口后可再捞回）
             if self.since and len(e.name) >= 12 and e.name[4:12] < self.since:
                 continue
-            ext = ".ogg" if self.have_ffmpeg else ".opus"
-            if (self.out_dir / f"{e.base}{ext}").exists():
+            if (self.out_dir / f"{e.base}.ogg").exists():
                 continue
             if self._fail_cooldown.get(e.name, 0) > 0:
                 log(f"⏳ {e.name} 上次下载失败，退避中（剩 {self._fail_cooldown[e.name]} 轮），本轮跳过")
@@ -255,9 +263,10 @@ class Daemon:
             log(f"🎙 发现新录音 {e.name}（{e.size / 1024:.0f} KB，约 {e.time} 秒）")
             try:
                 ogg_path = await self._download_one(pen, e)
-            except Exception:
+            except Exception as ex:  # noqa: BLE001 - 单文件失败不拖垮整轮，继续同步其他文件
                 self._fail_cooldown[e.name] = 3  # 失败退避 3 轮，防任何原因的失败立刻全量重下
-                raise
+                log(f"✗ 下载 {e.name} 失败：{type(ex).__name__}: {ex}（退避 3 轮，继续同步其他文件）")
+                continue
             new_count += 1
             # OGG 已校验落盘（.part→rename 完成）才发 file_synced
             emit("file_synced", {
@@ -378,11 +387,21 @@ class Daemon:
             await self._refresh_device_info()
         return self.snapshot()
 
-    async def config(self, since: str | None = None) -> dict:
-        """更新同步窗口：since 为 'YYYYMMDD' 紧凑串（只收该日起的录音），空/None=全部。"""
+    async def config(self, since: str | None = None, device_address: str | None = None) -> dict:
+        """更新同步窗口与绑定设备：since 为 'YYYYMMDD' 紧凑串（只收该日起的录音），
+        空/None=全部；device_address 为绑定 MAC（空/None=不绑定，按广播名匹配）。"""
         self.since = since or None
-        log(f"同步窗口：{'全部' if self.since is None else self.since + ' 起'}")
-        return {"since": self.since}
+        addr = (device_address or "").strip().upper() or None
+        if addr != self.device_address:
+            self.device_address = addr
+            if self.pen is not None:
+                # 绑定关系变化：断开当前连接，下一轮按新过滤条件重扫
+                async with self._conn_lock:
+                    await self._disconnect_pen()
+                self._clear_device_state()
+        log(f"同步窗口：{'全部' if self.since is None else self.since + ' 起'}；"
+            f"绑定设备：{addr or '未绑定（按名字匹配）'}")
+        return {"since": self.since, "device_address": addr}
 
     async def gc_device(self, names: list) -> dict:
         async with self._conn_lock:
@@ -415,7 +434,7 @@ async def _handle_request(daemon: Daemon, req: dict):
         "file_list": daemon.file_list,
         "sync_now": daemon.sync_now,
         "connect": daemon.connect,
-        "config": lambda: daemon.config(req.get("since")),
+        "config": lambda: daemon.config(req.get("since"), req.get("device_address")),
         "gc_device": lambda: daemon.gc_device(list(req.get("names") or [])),
     }
     handler = handlers.get(cmd)
@@ -464,13 +483,11 @@ async def main() -> int:
 
     parser = argparse.ArgumentParser(description="马赛福录音卡守护 sidecar")
     parser.add_argument("--out-dir", required=True, help="OGG 归档目录")
-    parser.add_argument("--ffmpeg", default="", help="ffmpeg 路径（为空则不校验时长，存裸 .opus）")
     parser.add_argument("--device-name", default="cb08", help="设备广播名（默认 cb08）")
     parser.add_argument("--poll", type=float, default=POLL_SECONDS, help="轮询间隔秒数（默认 30）")
     args = parser.parse_args()
 
-    ffmpeg = Path(args.ffmpeg) if args.ffmpeg else None
-    daemon = Daemon(Path(args.out_dir), ffmpeg, args.device_name, args.poll)
+    daemon = Daemon(Path(args.out_dir), args.device_name, args.poll)
 
     # Rust 等这行确认进程可用
     emit("ready", {"version": PROTOCOL_VERSION})

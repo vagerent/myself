@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { LogicalSize, PhysicalPosition, PhysicalSize } from "@tauri-apps/api/dpi";
 import { availableMonitors, getCurrentWindow } from "@tauri-apps/api/window";
-import type { AsrModelStatus, EntryPage, EntryRow, InsightsFinding, InsightsRun, InsightsThreadsState, InsightsToEntryResult, PnoteStatus, ReminderRow, SearchHit, Settings, SummaryRow, TreeStats } from "./types";
+import type { AsrModelStatus, EntryPage, EntryRow, InsightsFinding, InsightsRun, InsightsThreadsState, InsightsToEntryResult, PnoteStatus, PnoteSyncNowResult, ReminderRow, SearchHit, Settings, SummaryRow, TreeStats, TtsModelStatus } from "./types";
 
 export interface WindowState {
   fullWidth?: number;
@@ -29,6 +29,7 @@ export const api = {
   updateEntry: (id: number, title: string, category: string, tags: string) =>
     invoke<void>("update_entry", { id, title, category, tags }),
   getEntry: (id: number) => invoke<EntryRow>("get_entry", { id }),
+  deleteEntry: (id: number) => invoke<void>("delete_entry", { id }),
   listSummaries: () => invoke<SummaryRow[]>("list_summaries"),
   getSummary: (date: string) => invoke<SummaryRow>("get_summary", { date }),
   getTreeStats: () => invoke<TreeStats>("get_tree_stats"),
@@ -70,12 +71,20 @@ export const api = {
   downloadAsrModel: () => invoke<void>("download_asr_model"),
   generateDeepAnalysis: (entryId: number) =>
     invoke<string>("generate_deep_analysis", { entryId }),
+  ttsModelStatus: () => invoke<TtsModelStatus>("tts_model_status"),
+  downloadTtsModel: () => invoke<void>("download_tts_model"),
+  meetingSpeak: (entryId: number, voice: string, tab: string) =>
+    invoke<void>("meeting_speak", { entryId, voice, tab }),
+  meetingStopSpeak: () => invoke<void>("meeting_stop_speak"),
+  ttsReadWav: (path: string) => invoke<number[]>("tts_read_wav", { path }),
   pnoteStatus: () => invoke<PnoteStatus>("pnote_status"),
-  pnoteSyncNow: () => invoke<void>("pnote_sync_now"),
+  pnoteSyncNow: () => invoke<PnoteSyncNowResult>("pnote_sync_now"),
   pnoteFileList: () => invoke<unknown>("pnote_file_list"),
   pnoteSetEnabled: (enabled: boolean) => invoke<void>("pnote_set_enabled", { enabled }),
   pnoteConnectNow: () => invoke<PnoteStatus>("pnote_connect_now"),
   pnoteApplySettings: () => invoke<void>("pnote_apply_settings"),
+  pnoteBindDevice: () => invoke<string>("pnote_bind_device"),
+  pnoteUnbindDevice: () => invoke<void>("pnote_unbind_device"),
   insightsAnalyzeNow: () => invoke<void>("insights_analyze_now"),
   insightsRuns: () => invoke<InsightsRun[]>("insights_runs"),
   insightsFindings: (runId?: number) => invoke<InsightsFinding[]>("insights_findings", { runId }),

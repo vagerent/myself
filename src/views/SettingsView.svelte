@@ -3,7 +3,7 @@
   import { listen } from "@tauri-apps/api/event";
   import { api } from "../lib/api";
   import { loadSettings, showToast, settings, view } from "../lib/stores";
-  import type { AsrModelStatus, Settings } from "../lib/types";
+  import type { AsrModelStatus, PnoteStatus, Settings, TtsModelStatus } from "../lib/types";
 
   let form: Settings = {
     apiKey: "",
@@ -27,8 +27,8 @@
     clipboardEnabled: true,
     pnoteEnabled: false,
     pnoteKeepDays: 30,
-    pnoteFfmpegPath: "",
     pnoteSyncWindowDays: 2,
+    pnoteDeviceAddress: "",
     recorderEventPrompt: "",
     recorderMinutesPrompt: "",
     recorderDeepPrompt: "",
@@ -38,6 +38,9 @@
   let asrStatus: AsrModelStatus | null = null;
   let downloadingModel = false;
   let downloadText = "";
+  let ttsStatus: TtsModelStatus | null = null;
+  let downloadingTts = false;
+  let ttsDownloadText = "";
 
   // 设置分类页签
   const sections = [
@@ -91,6 +94,29 @@
     }
   }
 
+  async function refreshTtsStatus() {
+    try {
+      ttsStatus = await api.ttsModelStatus();
+    } catch (e) {
+      showToast("读取语音合成模型状态失败：" + String(e));
+    }
+  }
+
+  async function downloadTts() {
+    downloadingTts = true;
+    ttsDownloadText = "";
+    try {
+      await api.downloadTtsModel();
+      await refreshTtsStatus();
+      showToast("语音合成模型下载完成");
+    } catch (e) {
+      showToast("下载失败：" + String(e));
+    } finally {
+      downloadingTts = false;
+      ttsDownloadText = "";
+    }
+  }
+
   async function togglePnote(enabled: boolean) {
     try {
       await api.pnoteSetEnabled(enabled);
@@ -100,8 +126,56 @@
     }
   }
 
+  // 当前已连接录音卡的地址（pnote-status 快照 / pnote-state 事件），绑定按钮可用与否取决于它
+  let pnoteConnectedAddr: string | null = null;
+  let pnoteBinding = false;
+
+  async function refreshPnoteConnected() {
+    try {
+      const s = await api.pnoteStatus();
+      pnoteConnectedAddr = s.deviceAddress;
+    } catch {
+      pnoteConnectedAddr = null;
+    }
+  }
+
+  // 浏览页连接/断开录音卡时实时刷新，不必离开再进设置页
+  function onPnoteState(e: { payload: PnoteStatus }) {
+    pnoteConnectedAddr = e.payload.deviceAddress;
+  }
+
+  async function bindPnote() {
+    pnoteBinding = true;
+    try {
+      const addr = await api.pnoteBindDevice();
+      await loadSettings();
+      showToast("已绑定录音卡 " + addr);
+    } catch (e) {
+      showToast("绑定失败：" + String(e));
+    } finally {
+      pnoteBinding = false;
+    }
+  }
+
+  async function unbindPnote() {
+    pnoteBinding = true;
+    try {
+      await api.pnoteUnbindDevice();
+      await loadSettings();
+      showToast("已解绑，恢复按广播名匹配");
+    } catch (e) {
+      showToast("解绑失败：" + String(e));
+    } finally {
+      pnoteBinding = false;
+    }
+  }
+
+  // 进入录音卡设置页时刷新一次连接状态（绑定按钮依赖）
+  $: if (section === "pnote") refreshPnoteConnected();
+
   onMount(() => {
     refreshAsrStatus();
+    refreshTtsStatus();
     const unlistenDownload = listen<{ file: string; downloaded: number; total: number }>(
       "asr-download-progress",
       (e) => {
@@ -112,8 +186,21 @@
             : `已下载 ${(downloaded / 1024 / 1024).toFixed(1)} MB`;
       },
     );
+    const unlistenTts = listen<{ file: string; downloaded: number; total: number }>(
+      "tts-download-progress",
+      (e) => {
+        const { downloaded, total } = e.payload;
+        ttsDownloadText =
+          total > 0
+            ? `已下载 ${Math.floor((downloaded / total) * 100)}%`
+            : `已下载 ${(downloaded / 1024 / 1024).toFixed(1)} MB`;
+      },
+    );
+    const unlistenPnote = listen<PnoteStatus>("pnote-state", onPnoteState);
     return () => {
       unlistenDownload.then((f) => f());
+      unlistenTts.then((f) => f());
+      unlistenPnote.then((f) => f());
     };
   });
 </script>
@@ -247,6 +334,30 @@
         {/if}
         <span class="hint">包含语音识别（SenseVoice）、端点检测（FSMN-VAD）与说话人分离（CAM++）模型。</span>
       </div>
+
+      <div class="field">
+        <label>语音合成模型（朗读）</label>
+        <div class="field-row">
+          {#if ttsStatus}
+            <span class="hint">{ttsStatus.downloaded ? "已就绪" : "模型未下载"}</span>
+          {:else}
+            <span class="hint">读取状态中…</span>
+          {/if}
+          <button on:click={downloadTts} disabled={downloadingTts || ttsStatus?.downloaded}>
+            {downloadingTts ? "下载中…" : "下载模型"}
+          </button>
+          {#if downloadingTts && ttsDownloadText}
+            <span class="hint">{ttsDownloadText}</span>
+          {/if}
+        </div>
+        {#if ttsStatus}
+          <span class="hint">模型存放路径：{ttsStatus.path}</span>
+          {#if !ttsStatus.sidecarReady}
+            <span class="hint">TTS 组件未安装，请按 tools/build_sidecar.md 构建</span>
+          {/if}
+        {/if}
+        <span class="hint">Kokoro 中文语音合成模型（约 130MB，含 8 个音色），用于会议条目详情的「朗读」。</span>
+      </div>
     {:else if section === "pnote"}
       <div class="field">
         <label>开关</label>
@@ -261,6 +372,26 @@
           </label>
         </div>
         <span class="hint">启用后立即生效，常驻蓝牙连接；录音保存后自动下载、转写并入库（来源：录音卡）。</span>
+      </div>
+
+      <div class="field">
+        <label>设备绑定</label>
+        <div class="field-row">
+          {#if form.pnoteDeviceAddress}
+            <span>已绑定 {form.pnoteDeviceAddress}</span>
+            <button on:click={unbindPnote} disabled={pnoteBinding}>解绑</button>
+          {:else}
+            <span>
+              未绑定（按广播名匹配）{#if pnoteConnectedAddr}，当前连接 {pnoteConnectedAddr}{:else}，未连接设备{/if}
+            </span>
+            <button on:click={bindPnote} disabled={pnoteBinding || !pnoteConnectedAddr}>
+              绑定当前连接的设备
+            </button>
+          {/if}
+        </div>
+        <span class="hint"
+          >绑定后只同步这张卡，同名录音卡互不干扰；先在浏览页连接目标录音卡，再回此处点绑定。绑定/解绑立即生效并记入设置。</span
+        >
       </div>
 
       <div class="field">
@@ -281,12 +412,6 @@
         <span class="hint"
           >只同步窗口内开始的录音；窗口外的留在设备上不进库，改宽窗口后可自动捞回。</span
         >
-      </div>
-
-      <div class="field">
-        <label>ffmpeg 路径</label>
-        <input type="text" bind:value={form.pnoteFfmpegPath} placeholder="留空则不校验时长" />
-        <span class="hint">留空则不校验时长；录音卡同步需要 Windows 蓝牙。</span>
       </div>
 
       <div class="field">

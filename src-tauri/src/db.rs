@@ -96,6 +96,8 @@ pub struct RecorderFileRow {
     pub ogg_path: Option<String>,
     pub entry_id: Option<i64>,
     pub created_at: String,
+    /// 转写失败重试次数（达到上限后不再自动重试）
+    pub attempts: i64,
 }
 
 pub fn init(conn: &Connection) -> rusqlite::Result<()> {
@@ -163,7 +165,8 @@ pub fn init(conn: &Connection) -> rusqlite::Result<()> {
           status TEXT NOT NULL DEFAULT 'listed',
           ogg_path TEXT,
           entry_id INTEGER,
-          created_at TEXT NOT NULL
+          created_at TEXT NOT NULL,
+          attempts INTEGER NOT NULL DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS recorder_analysis_runs (
@@ -200,6 +203,7 @@ pub fn init(conn: &Connection) -> rusqlite::Result<()> {
     )?;
     ensure_column(conn, "entries", "deep_analysis", "TEXT")?;
     ensure_column(conn, "entries", "recorder_analyzed_at", "TEXT")?;
+    ensure_column(conn, "recorder_files", "attempts", "INTEGER NOT NULL DEFAULT 0")?;
     Ok(())
 }
 
@@ -273,11 +277,7 @@ pub fn insert_entry(
 ) -> rusqlite::Result<Option<i64>> {
     let ts = now_str();
     // 当日排重：哈希混入日期，去重范围限定为当天
-    let hash = if dedup_daily {
-        sha256(&format!("{}|{}", &ts[..10], content))
-    } else {
-        sha256(content)
-    };
+    let hash = entry_hash(content, dedup_daily, &ts);
     let n = conn.execute(
         "INSERT OR IGNORE INTO entries (raw_content, content_hash, source, created_at) VALUES (?1, ?2, ?3, ?4)",
         params![content, hash, source, ts],
@@ -288,6 +288,42 @@ pub fn insert_entry(
     let id = conn.last_insert_rowid();
     fts_replace(conn, "entry", &id.to_string(), content, "", "", "", "", "")?;
     Ok(Some(id))
+}
+
+/// 同 insert_entry，但内容已存在时返回既有条目的 id 与 false（新插入为 true）。
+/// 录音卡对账重试转写时用：必须把 entry_id 回填到 recorder_files，否则会陷入
+/// 「done 但 entry_id 为空 → 再转写」的循环。
+pub fn insert_entry_or_existing(
+    conn: &Connection,
+    content: &str,
+    source: &str,
+    dedup_daily: bool,
+) -> rusqlite::Result<(i64, bool)> {
+    let ts = now_str();
+    let hash = entry_hash(content, dedup_daily, &ts);
+    let n = conn.execute(
+        "INSERT OR IGNORE INTO entries (raw_content, content_hash, source, created_at) VALUES (?1, ?2, ?3, ?4)",
+        params![content, hash, source, ts],
+    )?;
+    if n > 0 {
+        let id = conn.last_insert_rowid();
+        fts_replace(conn, "entry", &id.to_string(), content, "", "", "", "", "")?;
+        return Ok((id, true));
+    }
+    let id = conn.query_row(
+        "SELECT id FROM entries WHERE content_hash = ?1 ORDER BY id DESC LIMIT 1",
+        params![hash],
+        |r| r.get(0),
+    )?;
+    Ok((id, false))
+}
+
+fn entry_hash(content: &str, dedup_daily: bool, ts: &str) -> String {
+    if dedup_daily {
+        sha256(&format!("{}|{}", &ts[..10], content))
+    } else {
+        sha256(content)
+    }
 }
 
 pub fn unprocessed_batch(conn: &Connection, limit: usize) -> rusqlite::Result<Vec<UnprocessedRow>> {
@@ -1063,7 +1099,8 @@ pub fn mark_reminder_missed(conn: &Connection, id: i64) -> rusqlite::Result<()> 
 
 // ---------- 录音卡同步 ----------
 
-const RECORDER_FILE_COLS: &str = "name, size, seconds, status, ogg_path, entry_id, created_at";
+const RECORDER_FILE_COLS: &str =
+    "name, size, seconds, status, ogg_path, entry_id, created_at, attempts";
 
 fn row_to_recorder_file(r: &rusqlite::Row<'_>) -> rusqlite::Result<RecorderFileRow> {
     Ok(RecorderFileRow {
@@ -1074,6 +1111,7 @@ fn row_to_recorder_file(r: &rusqlite::Row<'_>) -> rusqlite::Result<RecorderFileR
         ogg_path: r.get(4)?,
         entry_id: r.get(5)?,
         created_at: r.get(6)?,
+        attempts: r.get(7)?,
     })
 }
 
@@ -1124,10 +1162,43 @@ pub fn recorder_file_get(
     .optional()
 }
 
-/// 设备 GC 候选：status='done' 且 ogg 文件 mtime 早于 days 天。
-/// mtime 判断在 Rust 侧做（SQL 只取 done 行）；ogg 文件已不存在的不列入。
+/// 所有已登记的 name，供本地对账（磁盘有而库无的录音补登记）。
+pub fn recorder_file_all_names(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT name FROM recorder_files")?;
+    let rows = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// 登记 done 但还没转写入库（entry_id 为空）的记录，供对账重试转写。
+pub fn recorder_files_done_without_entry(
+    conn: &Connection,
+) -> rusqlite::Result<Vec<RecorderFileRow>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {RECORDER_FILE_COLS} FROM recorder_files
+         WHERE status = 'done' AND entry_id IS NULL AND ogg_path IS NOT NULL",
+    ))?;
+    let rows = stmt
+        .query_map([], |r| row_to_recorder_file(r))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// 转写失败次数 +1。
+pub fn recorder_file_touch_attempt(conn: &Connection, name: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE recorder_files SET attempts = attempts + 1 WHERE name = ?1",
+        params![name],
+    )?;
+    Ok(())
+}
+
+/// 设备 GC 候选：status='done'/'skipped' 且 ogg 文件 mtime 早于 days 天。
+/// mtime 判断在 Rust 侧做（SQL 只取候选行）；ogg 文件已不存在的不列入。
+/// skipped（无语音/裸 opus 无法转写）同样可清：本地与设备都不再需要保留。
 pub fn recorder_files_done_before(conn: &Connection, days: i64) -> rusqlite::Result<Vec<String>> {
-    let mut stmt = conn.prepare("SELECT name, ogg_path FROM recorder_files WHERE status = 'done'")?;
+    let mut stmt = conn.prepare("SELECT name, ogg_path FROM recorder_files WHERE status IN ('done','skipped')")?;
     let rows = stmt
         .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;

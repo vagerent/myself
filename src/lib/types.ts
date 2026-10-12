@@ -20,8 +20,8 @@ export interface Settings {
   clipboardEnabled: boolean;
   pnoteEnabled: boolean;
   pnoteKeepDays: number;
-  pnoteFfmpegPath: string;
   pnoteSyncWindowDays: number;
+  pnoteDeviceAddress: string;
   recorderEventPrompt: string;
   recorderMinutesPrompt: string;
   recorderDeepPrompt: string;
@@ -37,6 +37,12 @@ export interface PnoteStatus {
   version: string | null;
   sleeping: boolean;
   pending: number;
+  deviceAddress: string | null;
+}
+
+export interface PnoteSyncNowResult {
+  /** false = 请求超时但下载仍在后台继续，完成后自动入库 */
+  completed: boolean;
 }
 
 export interface EntryRow {
@@ -118,6 +124,22 @@ export interface AsrModelStatus {
   downloaded: boolean;
   path: string;
   sidecarReady: boolean;
+}
+
+export interface TtsModelStatus {
+  downloaded: boolean;
+  path: string;
+  sidecarReady: boolean;
+  voices: string[];
+}
+
+export interface TtsChunk {
+  entryId: number;
+  index: number;
+  total: number;
+  wav: string;
+  duration: number;
+  text: string;
 }
 
 export interface InsightsRun {

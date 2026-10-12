@@ -16,8 +16,9 @@ use db::Db;
 use settings::Settings;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tauri::Manager;
 use tokio::sync::oneshot;
 
@@ -53,6 +54,13 @@ pub struct AppState {
     pub pnote_ready: Mutex<Option<oneshot::Sender<()>>>,
     /// 同步/转写重入守卫
     pub pnote_busy: AtomicBool,
+    /// sync_now 请求重入守卫（下载阶段不持 pnote_busy，单独防重复点击）
+    pub pnote_sync_req: AtomicBool,
+    /// sidecar 快速崩溃计数（存活 <60s 即崩溃），连续 5 次后停止自动拉起
+    pub pnote_fast_crashes: AtomicU32,
+    /// 崩溃自动重启通知：监控任务发消息，常驻重启任务（spawn_inner 懒建）负责拉起，
+    /// 避免监控块直接 await ensure_sidecar 造成 Send 自引用环
+    pub pnote_restart_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<()>>>,
     /// 洞察分析重入守卫（手动触发与间隔调度共用）
     pub insights_busy: AtomicBool,
     /// 上次洞察分析尝试时间（成功/失败都记，调度节流用）
@@ -132,13 +140,51 @@ pub fn run() {
                 pnote_pending: Mutex::new(HashMap::new()),
                 pnote_ready: Mutex::new(None),
                 pnote_busy: AtomicBool::new(false),
+                pnote_sync_req: AtomicBool::new(false),
+                pnote_fast_crashes: AtomicU32::new(0),
+                pnote_restart_tx: Mutex::new(None),
                 insights_busy: AtomicBool::new(false),
                 insights_last_run: Mutex::new(None),
                 pnote_spawn_lock: tokio::sync::Mutex::new(()),
                 pnote_gen: AtomicU64::new(0),
             });
 
-            if let Err(e) = hotkey::apply_hotkey(app_handle, &settings.hotkey) {
+            // 崩溃自动重启任务：监控任务只发通知（同步 send，不 await 拉起链路），
+    // 由这里统一拉起并补发 start。独立顶层任务而非在 spawn_inner 里创建——
+    // 否则「监控块 → ensure_sidecar → spawn_inner」构成 Send 自引用环，编译不过。
+    {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        if let Ok(mut guard) = app_handle.state::<AppState>().pnote_restart_tx.lock() {
+            *guard = Some(tx);
+        }
+        let app_restart = app_handle.clone();
+        tauri::async_runtime::spawn(async move {
+            while rx.recv().await.is_some() {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                let enabled = {
+                    let st = app_restart.state::<AppState>();
+                    st.settings.lock().map(|s| s.pnote_enabled).unwrap_or(false)
+                };
+                if !enabled {
+                    continue; // 通知发出后被停用，不拉
+                }
+                log::info!("录音卡组件自动重启");
+                if let Err(e) = pnote::ensure_sidecar(&app_restart).await {
+                    log::warn!("录音卡组件自动重启失败: {e}");
+                    continue;
+                }
+                if let Err(e) = pnote::start_daemon(&app_restart).await {
+                    log::warn!("录音卡守护循环自动重启失败: {e}");
+                    continue;
+                }
+                if let Err(e) = pnote::push_sync_window(&app_restart).await {
+                    log::warn!("录音卡同步窗口重推失败: {e}");
+                }
+            }
+        });
+    }
+
+    if let Err(e) = hotkey::apply_hotkey(app_handle, &settings.hotkey) {
                 log::warn!("全局快捷键注册失败（不影响使用）: {e}");
             }
             // 录音卡常驻 sidecar：fire-and-forget，不阻塞启动；失败仅记日志，
@@ -158,6 +204,11 @@ pub fn run() {
                     // 把同步时间窗口推给 sidecar（无状态过滤：窗口外直接跳过）
                     if let Err(e) = pnote::push_sync_window(&app2).await {
                         log::warn!("录音卡同步窗口推送失败: {e}");
+                    }
+                    // 对账：下载过但登记丢失的录音（App 重启瞬态丢事件）补登记补转写
+                    let rescued = pnote::reconcile_recorder_files(&app2).await;
+                    if rescued > 0 {
+                        log::info!("录音卡对账：补登记 {rescued} 个磁盘录音");
                     }
                 });
             }
@@ -209,6 +260,8 @@ pub fn run() {
             pnote::pnote_file_list,
             pnote::pnote_connect_now,
             pnote::pnote_apply_settings,
+            pnote::pnote_bind_device,
+            pnote::pnote_unbind_device,
             pnote::pnote_set_enabled,
             insights::insights_analyze_now,
             insights::insights_runs,

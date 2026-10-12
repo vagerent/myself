@@ -7,6 +7,7 @@
 use crate::db;
 use crate::meeting;
 use crate::AppState;
+use rusqlite::params;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -22,6 +23,8 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 // 全量同步下载 12MB 约 11 分钟，给 20 分钟余量
 const SYNC_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+/// 转写失败自动重试上限（每次 sync_now 一轮计一次），超过后保留 failed 记录但不再重试
+const MAX_TRANSCRIBE_ATTEMPTS: i64 = 3;
 
 /// 录音卡设备状态快照；字段与前端 types.ts 的 PnoteStatus 一致（camelCase）。
 /// 注意：协议里 battery==110 表示充电中（展示为 100% + 充电标记）。
@@ -38,6 +41,10 @@ pub struct PnoteStatus {
     // sidecar 的 status 响应只有设备字段、不含 pending（本地待转写计数由 pnote_status 补）
     #[serde(default)]
     pub pending: i64,
+    /// 当前连接设备的 MAC 地址（未连接/旧版 sidecar 为 None），供绑定用。
+    /// sidecar 协议字段是 snake_case 的 device_address，用 alias 兼容
+    #[serde(default, alias = "device_address")]
+    pub device_address: Option<String>,
 }
 
 /// 录音卡组件（PyInstaller 冻结的 pnote-sidecar）路径。
@@ -87,21 +94,36 @@ pub async fn pnote_status(app: AppHandle) -> Result<PnoteStatus, String> {
     Ok(status)
 }
 
+/// 立即跑一轮同步的结果：completed=false 表示 20 分钟超时，下载仍在后台继续
+/// （sidecar 不受 Rust 超时影响，落库照旧），前端应提示「后台同步中」而非失败。
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PnoteSyncOutcome {
+    pub completed: bool,
+}
+
 /// 立即跑一轮同步。响应可能很慢（下载 12MB 约 11 分钟），超时给 20 分钟。
-/// 响应返回后顺带重试此前转写失败且 ogg 仍在本地的记录。
+/// 只持请求重入守卫，不持 pnote_busy：下载与转写并行，file_synced 事件随到随转。
+/// 响应返回后（无论成败）做对账补登记，并重试此前转写失败的记录（有次数上限）。
 #[tauri::command]
-pub async fn pnote_sync_now(app: AppHandle) -> Result<(), String> {
+pub async fn pnote_sync_now(app: AppHandle) -> Result<PnoteSyncOutcome, String> {
     let state = app.state::<AppState>();
-    if state.pnote_busy.swap(true, Ordering::SeqCst) {
+    if state.pnote_sync_req.swap(true, Ordering::SeqCst) {
         return Err("已有录音卡同步任务进行中".into());
     }
     let result: Result<serde_json::Value, String> =
         pnote_request(&app, "sync_now", serde_json::json!({}), SYNC_TIMEOUT).await;
-    state.pnote_busy.store(false, Ordering::SeqCst);
+    state.pnote_sync_req.store(false, Ordering::SeqCst);
+    reconcile_recorder_files(&app).await;
     for (name, ogg, seconds, size) in failed_records(&app) {
         spawn_transcribe(app.clone(), name, ogg, seconds, size);
     }
-    result.map(|_| ())
+    match result {
+        Ok(_) => Ok(PnoteSyncOutcome { completed: true }),
+        // 超时≠失败：sidecar 还在下载，file_synced 事件随后照常落库
+        Err(e) if e.contains("响应超时") => Ok(PnoteSyncOutcome { completed: false }),
+        Err(e) => Err(e),
+    }
 }
 
 /// 设备端文件列表。
@@ -152,19 +174,28 @@ fn window_cutoff(days: i64) -> Option<String> {
     Some(start.format("%Y%m%d").to_string())
 }
 
-/// 把当前同步窗口推给 sidecar（config 命令）。sidecar 未启用/未运行时静默跳过。
+/// 把同步窗口与绑定设备推给 sidecar（config 命令）。sidecar 未启用/未运行时静默跳过。
 pub async fn push_sync_window(app: &AppHandle) -> Result<(), String> {
-    let days = {
+    let (days, device_address) = {
         let state = app.state::<AppState>();
         let settings = state.settings.lock().map_err(|e| e.to_string())?;
-        settings.pnote_sync_window_days
+        (settings.pnote_sync_window_days, settings.pnote_device_address.clone())
     };
     if !enabled_or_running(app).await {
         return Ok(());
     }
     let since = window_cutoff(days);
-    pnote_request::<serde_json::Value>(app, "config", serde_json::json!({ "since": since }), REQUEST_TIMEOUT)
-        .await?;
+    let addr = device_address.trim();
+    pnote_request::<serde_json::Value>(
+        app,
+        "config",
+        serde_json::json!({
+            "since": since,
+            "device_address": if addr.is_empty() { serde_json::Value::Null } else { addr.into() },
+        }),
+        REQUEST_TIMEOUT,
+    )
+    .await?;
     Ok(())
 }
 
@@ -191,6 +222,45 @@ pub async fn pnote_apply_settings(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// 绑定当前已连接的录音卡：把它的 MAC 存入设置，此后只连这张卡
+/// （同名设备再多也不串）。绑定立即推送 sidecar，并断开重连一次以生效。
+#[tauri::command]
+pub async fn pnote_bind_device(app: AppHandle) -> Result<String, String> {
+    let address = {
+        let state = app.state::<AppState>();
+        let latest = state.pnote_latest.lock().map_err(|e| e.to_string())?;
+        latest.device_address.clone()
+    };
+    let address = address.ok_or("尚未连接录音卡，无法获取设备地址，请先连接后再绑定")?;
+    {
+        let state = app.state::<AppState>();
+        let path = state.settings_path.clone();
+        let mut settings = state.settings.lock().map_err(|e| e.to_string())?;
+        settings.pnote_device_address = address.clone();
+        settings.save(&path)?;
+    }
+    if let Err(e) = push_sync_window(&app).await {
+        log::warn!("绑定后推送录音卡配置失败: {e}");
+    }
+    Ok(address)
+}
+
+/// 解绑：清除绑定的设备，恢复按广播名匹配（同名设备谁广播就连谁）。
+#[tauri::command]
+pub async fn pnote_unbind_device(app: AppHandle) -> Result<(), String> {
+    {
+        let state = app.state::<AppState>();
+        let path = state.settings_path.clone();
+        let mut settings = state.settings.lock().map_err(|e| e.to_string())?;
+        settings.pnote_device_address = String::new();
+        settings.save(&path)?;
+    }
+    if let Err(e) = push_sync_window(&app).await {
+        log::warn!("解绑后推送录音卡配置失败: {e}");
+    }
+    Ok(())
+}
+
 /// 启用/停用录音卡同步。启用即拉起 sidecar 并启动守护循环；停用发 stop 后 kill。
 /// 照 commands.rs save_settings 的写法：锁 settings、改字段、调 .save。
 #[tauri::command]
@@ -204,6 +274,10 @@ pub async fn pnote_set_enabled(app: AppHandle, enabled: bool) -> Result<(), Stri
         saved?;
     }
     if enabled {
+        // 用户显式重开：复位快速崩溃计数，允许再次自动拉起
+        app.state::<AppState>()
+            .pnote_fast_crashes
+            .store(0, Ordering::SeqCst);
         ensure_sidecar(&app).await?;
         start_daemon(&app).await?;
         push_sync_window(&app).await?;
@@ -246,17 +320,11 @@ async fn spawn_inner(app: &AppHandle) -> Result<oneshot::Receiver<()>, String> {
         .map_err(|e| e.to_string())?
         .join("recorder-audio");
     std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
-    let ffmpeg = {
-        let state = app.state::<AppState>();
-        let settings = state.settings.lock().map_err(|e| e.to_string())?;
-        settings.pnote_ffmpeg_path.clone()
-    };
-
     let mut cmd = tokio::process::Command::new(&exe);
     cmd.arg("--out-dir")
         .arg(&out_dir)
-        .arg("--ffmpeg")
-        .arg(&ffmpeg)
+        .arg("--device-name")
+        .arg("cb08")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -306,9 +374,12 @@ async fn spawn_inner(app: &AppHandle) -> Result<oneshot::Receiver<()>, String> {
         read_stderr_loop(stderr).await;
     });
 
-    // 崩溃监控：轮询子进程状态，退出时清句柄 + 通知前端断开；下次 ensure 重新拉起
+    // 崩溃监控：轮询子进程状态。退出时清句柄 + 通知前端；启用状态下自动重新拉起
+    // 并补发 start（守护循环不会自己启动）。快速崩溃（存活 <60s）连撞 5 次后停止
+    // 自动拉起，避免坏组件无限自旋，需用户在设置里重开开关复位。
     let app_mon = app.clone();
     tokio::spawn(async move {
+        let spawned_at = std::time::Instant::now();
         loop {
             tokio::time::sleep(Duration::from_millis(500)).await;
             let state = app_mon.state::<AppState>();
@@ -341,9 +412,43 @@ async fn spawn_inner(app: &AppHandle) -> Result<oneshot::Receiver<()>, String> {
                         PnoteStatus::default()
                     }
                 };
-                log::warn!("录音卡组件已退出（崩溃或被终止），下次调用将自动重启");
+                log::warn!("录音卡组件已退出（崩溃或被终止）");
                 let _ = app_mon.emit("pnote-state", snapshot);
-                return;
+
+                let enabled = {
+                    let state2 = app_mon.state::<AppState>();
+                    state2
+                        .settings
+                        .lock()
+                        .map(|s| s.pnote_enabled)
+                        .unwrap_or(false)
+                };
+                if !enabled {
+                    return; // 用户已停用，保持退出
+                }
+                let fast = spawned_at.elapsed() < Duration::from_secs(60);
+                let fast_crashes = if fast {
+                    state.pnote_fast_crashes.fetch_add(1, Ordering::SeqCst) + 1
+                } else {
+                    state.pnote_fast_crashes.store(0, Ordering::SeqCst);
+                    0
+                };
+                if fast_crashes >= 5 {
+                    log::error!(
+                        "录音卡组件连续快速崩溃 {fast_crashes} 次，已停止自动重启；\
+                         请在设置中关闭再开启「录音卡同步」以重试"
+                    );
+                    return;
+                }
+                // 不在这里 await ensure_sidecar（监控块 → ensure_sidecar → spawn_inner
+                // 会构成 Send 自引用环，编译不过）：通知常驻重启任务去拉起，
+                // 拉起路径与原启动链一致（ensure → start → 推窗口）。
+                if let Ok(guard) = state.pnote_restart_tx.lock() {
+                    if let Some(tx) = guard.as_ref() {
+                        let _ = tx.send(());
+                    }
+                }
+                return; // 新实例有自己的监控任务，本任务退场
             }
         }
     });
@@ -456,13 +561,14 @@ fn with_db<T>(
     f(&conn).map_err(|e| e.to_string())
 }
 
-/// status='failed' 且 ogg 文件仍在本地的记录，供 sync_now 后重试转写。
+/// status='failed'、重试未超上限且 ogg 文件仍在本地的记录，供 sync_now 后重试转写。
 fn failed_records(app: &AppHandle) -> Vec<(String, String, i64, i64)> {
     let rows = with_db(app, |conn| {
         let mut stmt = conn.prepare(
-            "SELECT name, ogg_path, seconds, size FROM recorder_files WHERE status = 'failed'",
+            "SELECT name, ogg_path, seconds, size FROM recorder_files
+             WHERE status = 'failed' AND attempts < ?1",
         )?;
-        let mapped = stmt.query_map([], |r| {
+        let mapped = stmt.query_map(params![MAX_TRANSCRIBE_ATTEMPTS], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, Option<String>>(1)?,
@@ -479,6 +585,93 @@ fn failed_records(app: &AppHandle) -> Vec<(String, String, i64, i64)> {
             _ => None,
         })
         .collect()
+}
+
+/// 本地对账：磁盘上已下载但库里没有登记的录音（file_synced 事件在 App 重启等
+/// 瞬态窗口丢失就会这样，sidecar 又按「本地已存在」跳过，从此查无此文件），
+/// 补登记后补转写；另把「登记 done 但 entry_id 为空」的记录重新排队转写。
+/// 在启动与每次 sync_now 后各跑一遍，返回补登记的数量。
+pub async fn reconcile_recorder_files(app: &AppHandle) -> usize {
+    let out_dir = match app.path().app_data_dir() {
+        Ok(d) => d.join("recorder-audio"),
+        Err(e) => {
+            log::warn!("录音卡对账：归档目录定位失败: {e}");
+            return 0;
+        }
+    };
+    let disk_files: Vec<(String, PathBuf)> = std::fs::read_dir(&out_dir)
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.is_file()
+                        && matches!(
+                            p.extension().and_then(|x| x.to_str()),
+                            Some("ogg" | "opus")
+                        )
+                })
+                .filter_map(|p| {
+                    p.file_stem()
+                        .and_then(|s| s.to_str())
+                        .map(|s| (s.to_string(), p.clone()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let db_names = with_db(app, |conn| db::recorder_file_all_names(conn)).unwrap_or_default();
+    let mut rescued = 0usize;
+    let mut rescued_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (stem, path) in disk_files {
+        // 设备文件名入库时按 20 字节截断（stem + 扩展名首字符），用前缀匹配
+        if db_names.iter().any(|n| n.starts_with(&stem)) {
+            continue;
+        }
+        let size = std::fs::metadata(&path).map(|m| m.len() as i64).unwrap_or(0);
+        let name = format!("{stem}.");
+        rescued_names.insert(name.clone());
+        let ext_is_ogg = path.extension().and_then(|x| x.to_str()) == Some("ogg");
+        if !ext_is_ogg {
+            // 裸 .opus 无 ffmpeg 封装，转写必败：登记 skipped 并说明，不再重试
+            log::warn!("录音卡对账：{stem} 为裸 .opus（未配置 ffmpeg），无法转写，标记 skipped");
+            let _ = with_db(app, |conn| {
+                db::recorder_file_upsert(conn, &name, size, 0, "skipped")?;
+                db::recorder_file_mark(conn, &name, "skipped", None, Some(&path.to_string_lossy()))
+            });
+            rescued += 1;
+            continue;
+        }
+        log::info!("录音卡对账：{stem} 已下载但无登记（file_synced 丢失），补登记并转写");
+        let _ = with_db(app, |conn| {
+            db::recorder_file_upsert(conn, &name, size, 0, "done")?;
+            db::recorder_file_mark(conn, &name, "done", None, Some(&path.to_string_lossy()))
+        });
+        spawn_transcribe(app.clone(), name, path.to_string_lossy().into_owned(), 0, size);
+        rescued += 1;
+    }
+
+    // 登记 done 但一直没有 entry 的记录（登记后进程崩溃等），重新排队转写
+    let orphans = with_db(app, |conn| db::recorder_files_done_without_entry(conn))
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| {
+            r.ogg_path
+                .as_deref()
+                .map(|p| Path::new(p).is_file())
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    for r in orphans {
+        log::info!("录音卡对账：{name} 已登记 done 但未转写，补排队", name = r.name);
+        spawn_transcribe(
+            app.clone(),
+            r.name,
+            r.ogg_path.unwrap_or_default(),
+            r.seconds,
+            r.size,
+        );
+    }
+    rescued
 }
 
 /// 排队一个录音卡转写任务（file_synced 事件与 sync_now 失败重试共用）。
@@ -507,11 +700,24 @@ fn spawn_transcribe(app: AppHandle, name: String, ogg_path: String, seconds: i64
         }
         .await;
         if let Err(e) = result {
-            log::warn!("录音卡转写入库失败（{name}）: {e}");
-            // ogg 与设备原件都保留，标 failed 后由下次 sync_now 重试
-            let _ = with_db(&app, |conn| {
-                db::recorder_file_mark(conn, &name, "failed", None, None)
-            });
+            if e == meeting::NO_SPEECH_ERROR {
+                // 文件本身没有可识别语音（静默录音等）：永久跳过，不再重试
+                log::info!("录音卡转写无有效语音（{name}），标记 skipped，不再重试");
+                let _ = with_db(&app, |conn| {
+                    db::recorder_file_mark(conn, &name, "skipped", None, None)
+                });
+            } else {
+                log::warn!("录音卡转写入库失败（{name}）: {e}");
+                // ogg 与设备原件都保留，标 failed 后由下次 sync_now 重试（有次数上限）。
+                // 排队类超时是系统拥堵不是文件问题，不计次数。
+                let congestion = e.contains("排队超时") || e.contains("占用语音识别超过 10 分钟");
+                let _ = with_db(&app, |conn| {
+                    if !congestion {
+                        db::recorder_file_touch_attempt(conn, &name)?;
+                    }
+                    db::recorder_file_mark(conn, &name, "failed", None, None)
+                });
+            }
         }
     });
 }
@@ -539,27 +745,33 @@ async fn transcribe_recorder_file(
         }
     }
     let transcript = meeting::transcribe_audio(app, Path::new(ogg_path)).await?;
-    let text = format!("（时长约 {seconds} 秒｜文件名 {name}）\n\n{transcript}");
+    let text = if seconds > 0 {
+        format!("（时长约 {seconds} 秒｜文件名 {name}）\n\n{transcript}")
+    } else {
+        // 对账补登记的录音没有设备元数据，时长未知（转写后由内容自身说明）
+        format!("（文件名 {name}）\n\n{transcript}")
+    };
     let dedup_daily = {
         let state = app.state::<AppState>();
         let s = state.settings.lock().map_err(|e| e.to_string())?;
         s.dedup_scope != "all"
     };
-    let entry_id = with_db(app, |conn| {
-        db::insert_entry(conn, &text, "recorder", dedup_daily)
+    // 重复内容也要拿到既有 entry 的 id 回填，否则对账会把这条记录当孤儿反复重转
+    let (entry_id, inserted) = with_db(app, |conn| {
+        db::insert_entry_or_existing(conn, &text, "recorder", dedup_daily)
     })?;
-    // 重复内容（entry_id=None）也标 done，entry_id 留空即可
     with_db(app, |conn| {
-        db::recorder_file_mark(conn, name, "done", entry_id, None)
+        db::recorder_file_mark(conn, name, "done", Some(entry_id), None)
     })?;
     let _ = app.emit(
         "pnote-synced",
-        serde_json::json!({"newEntries": if entry_id.is_some() { 1 } else { 0 }, "name": name}),
+        serde_json::json!({"newEntries": if inserted { 1 } else { 0 }, "name": name}),
     );
     // 自动静默分析：纪要 → 深度解析。分析时长不阻塞 UI（事件已发），
-    // 但占着 pnote_busy，避免多个文件的分析并发打 API
-    if let Some(id) = entry_id {
-        analyze_recorder_entry(app, id, &transcript).await;
+    // 但占着 pnote_busy，避免多个文件的分析并发打 API。
+    // 仅对新插入的条目分析；对账补写时重复命中既有条目，不重复分析。
+    if inserted {
+        analyze_recorder_entry(app, entry_id, &transcript).await;
     }
     Ok(())
 }
@@ -675,6 +887,14 @@ fn merge_state_event(latest: &mut PnoteStatus, data: &serde_json::Value) {
         Some(v) => match v.as_str() {
             Some(s) => latest.version = Some(s.to_string()),
             None => bad.push("version"),
+        },
+        None => {}
+    }
+    match obj.get("device_address") {
+        Some(v) if v.is_null() => latest.device_address = None,
+        Some(v) => match v.as_str() {
+            Some(s) => latest.device_address = Some(s.to_string()),
+            None => bad.push("device_address"),
         },
         None => {}
     }
@@ -1028,9 +1248,36 @@ mod tests {
             "version",
             "sleeping",
             "pending",
+            "deviceAddress",
         ] {
             assert!(obj.contains_key(key), "快照缺少字段 {key}");
         }
-        assert_eq!(obj.len(), 8, "快照字段数应与 types.ts PnoteStatus 一致");
+        assert_eq!(obj.len(), 9, "快照字段数应与 types.ts PnoteStatus 一致");
+    }
+
+    /// sidecar 的 status 响应/事件是 snake_case 的 device_address，
+    /// 必须能反序列化进 camelCase 字段（绑定功能依赖）
+    #[test]
+    fn pnote_status_deserializes_sidecar_snake_case() {
+        let s: PnoteStatus = serde_json::from_str(
+            r#"{"running":true,"connected":true,"battery":74,"charging":false,
+                "capacity":null,"version":"1.0","sleeping":false,
+                "device_address":"AA:BB:CC:DD:EE:FF"}"#,
+        )
+        .unwrap();
+        assert_eq!(s.device_address.as_deref(), Some("AA:BB:CC:DD:EE:FF"));
+        // 未连接时 sidecar 给 null；旧版 sidecar 干脆不给这个字段
+        let s: PnoteStatus = serde_json::from_str(
+            r#"{"running":true,"connected":false,"battery":null,"charging":false,
+                "capacity":null,"version":null,"sleeping":true,"device_address":null}"#,
+        )
+        .unwrap();
+        assert_eq!(s.device_address, None);
+        let s: PnoteStatus = serde_json::from_str(
+            r#"{"running":false,"connected":false,"battery":null,"charging":false,
+                "capacity":null,"version":null,"sleeping":false}"#,
+        )
+        .unwrap();
+        assert_eq!(s.device_address, None, "旧版 sidecar 无此字段应缺省 None");
     }
 }

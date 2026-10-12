@@ -97,7 +97,10 @@ async fn pnote_cleanup_loop(app: AppHandle) {
         if let Ok(entries) = std::fs::read_dir(&dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("ogg") {
+                if !matches!(
+                    path.extension().and_then(|e| e.to_str()),
+                    Some("ogg" | "opus")
+                ) {
                     continue;
                 }
                 let stale = entry
@@ -111,7 +114,7 @@ async fn pnote_cleanup_loop(app: AppHandle) {
             }
         }
         if removed > 0 {
-            log::info!("录音归档清理：删除 {removed} 个超过 {keep_days} 天的 ogg 文件");
+            log::info!("录音归档清理：删除 {removed} 个超过 {keep_days} 天的归档文件");
         }
     }
 }

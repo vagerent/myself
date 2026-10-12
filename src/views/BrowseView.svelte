@@ -186,7 +186,9 @@
     pnoteSyncing = true;
     pnoteStage = "正在同步…";
     try {
-      await api.pnoteSyncNow();
+      const r = await api.pnoteSyncNow();
+      // 超时≠失败：sidecar 仍在后台下载，落库照常，完成后列表自动出现
+      showToast(r.completed ? "同步完成" : "下载较慢，仍在后台同步，完成后自动入库");
     } catch (e) {
       showToast("同步失败：" + String(e));
     } finally {

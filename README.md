@@ -28,8 +28,9 @@
 - **音频导入转写**：浏览页导入常见音频格式（mp3/m4a/wav 等），本地解码后经 SenseVoice 模型离线转写，全程不联网
 - **发言人分离 + 时间戳**：CAM++ 声纹模型自动区分说话人，转写文本带 `[说话人N mm:ss]` 前缀
 - **AI 会议纪要**：转写全文自动送入 AI 生成结构化纪要，提示词模板可自定义；详情页「会议纪要 / 原始内容」页签随时对照
+- **朗读纪要 / 原文**：本地 Kokoro 中文语音合成（纯离线），边合成边播、8 个音色可选、支持暂停与倍速；合成结果按文本缓存，重播秒开
 - **进度可视**：解码、说话人分析、逐块转写、纪要生成各阶段均有进度条
-- **模型按需下载**：首次使用从 ModelScope 一键下载语音识别 / 端点检测 / 声纹三个模型（约 260MB），设置页查看状态
+- **模型按需下载**：首次使用从 ModelScope 一键下载语音识别 / 端点检测 / 声纹三个模型（约 260MB），朗读功能另需语音合成模型（约 130MB），设置页查看状态
 
 ### 搜索与问答
 
@@ -77,12 +78,13 @@ npm run tauri dev
 - **主窗口**：左侧分类树（全部 / 分类 / 来源 / 每日汇总 / 每周汇总 / 定时任务），右侧条目列表与详情；搜索在当前选中节点内过滤，无结果时自动进入 AI 兜底搜索；列表超过 20 条自动分页；支持手动记录灵感
 - **设置页**：左侧分类导航（AI 服务 / 汇总 / 会议录音 / 通用），含 API Key、模型、base_url、汇总时间、每周汇总（星期几 + 时间）、空闲阈值、快捷键、Markdown 输出目录、各类提示词模板、语音模型下载、排重方式、主题、开机自启、剪贴板监控开关
 
-> AI 功能（预处理、汇总、问答、兜底搜索、会议纪要）依赖 OpenAI 兼容的 Chat Completions API，未配置 API Key 时自动跳过，不影响收集与搜索。语音转写为纯本地离线推理，不需要 API Key。
+> AI 功能（预处理、汇总、问答、兜底搜索、会议纪要）依赖 OpenAI 兼容的 Chat Completions API，未配置 API Key 时自动跳过，不影响收集与搜索。语音转写与朗读均为纯本地离线推理，不需要 API Key。
 
 ## 技术栈
 
 - **后端**：Tauri 2（Rust）、rusqlite（SQLite + FTS5 trigram）、reqwest（OpenAI 兼容 API）、symphonia + rubato（音频解码与重采样）
 - **语音转写**：PyInstaller 冻结的 funasr-onnx sidecar（SenseVoiceSmall 识别 + FSMN-VAD 端点检测 + CAM++ 说话人分离），构建方法见 `tools/build_sidecar.md`
+- **语音合成**：PyInstaller 冻结的 Kokoro sidecar（Kokoro-82M v1.1-zh ONNX fp16 + misaki[zh] G2P），构建方法同见 `tools/build_sidecar.md`
 - **前端**：Svelte 4 + TypeScript + Vite
 
 ## 数据位置
@@ -90,7 +92,8 @@ npm run tauri dev
 | 数据 | 位置 |
 | --- | --- |
 | SQLite 数据库 / 设置 / 窗口状态 | `%APPDATA%\com.masaifu.desktop\` |
-| 语音模型（识别 / VAD / 声纹） | `%APPDATA%\com.masaifu.desktop\models\` |
+| 语音模型（识别 / VAD / 声纹 / 合成） | `%APPDATA%\com.masaifu.desktop\models\` |
+| 朗读音频缓存 | `%APPDATA%\com.masaifu.desktop\tts-cache\` |
 | 每日汇总 Markdown | `文档\Masaifu\daily\YYYY-MM-DD.md`（可修改） |
 | 每周汇总 Markdown | `文档\Masaifu\weekly\YYYY-Www.md` |
 
